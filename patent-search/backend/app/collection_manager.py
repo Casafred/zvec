@@ -11,8 +11,8 @@ COLLECTION_NAME = "patents"
 _collection: zvec.Collection | None = None
 
 
-def _build_schema(dimension: int) -> zvec.CollectionSchema:
-    """构建专利集合的 schema"""
+def _build_schema(dimension: int = 512) -> zvec.CollectionSchema:
+    """构建专利集合的 schema（双向量：标题摘要 + 权利要求）"""
     return zvec.CollectionSchema(
         name=COLLECTION_NAME,
         fields=[
@@ -24,7 +24,15 @@ def _build_schema(dimension: int) -> zvec.CollectionSchema:
         ],
         vectors=[
             zvec.VectorSchema(
-                "embedding",
+                "title_abs_vec",
+                zvec.DataType.VECTOR_FP32,
+                dimension=dimension,
+                index_param=zvec.HnswIndexParam(
+                    metric_type=zvec.MetricType.COSINE,
+                ),
+            ),
+            zvec.VectorSchema(
+                "claims_vec",
                 zvec.DataType.VECTOR_FP32,
                 dimension=dimension,
                 index_param=zvec.HnswIndexParam(
@@ -35,7 +43,7 @@ def _build_schema(dimension: int) -> zvec.CollectionSchema:
     )
 
 
-def get_or_create_collection(dimension: int) -> zvec.Collection:
+def get_or_create_collection(dimension: int = 512) -> zvec.Collection:
     """获取或创建集合（懒初始化单例）
 
     如果路径已存在则打开，否则创建并打开。

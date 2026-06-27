@@ -1,5 +1,6 @@
-"""数据导入路由"""
+"""数据导入路由（双向量：标题摘要 + 权利要求）"""
 import json
+import re
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
@@ -18,6 +19,9 @@ CONFIG_FILE = Path(__file__).resolve().parent.parent.parent / "data" / "config.j
 # 批量参数
 EMBEDDING_BATCH_SIZE = 50
 INSERT_BATCH_SIZE = 100
+
+# 向量维度（Qwen3-Embedding-0.6B 固定使用 512 维）
+VECTOR_DIMENSION = 512
 
 
 class ImportRequest(BaseModel):
@@ -49,10 +53,44 @@ def _read_config() -> dict:
         return json.load(f)
 
 
-def _build_text(row: dict, mapping: dict[str, str | None]) -> str:
-    """根据映射关系拼接文本：标题 + 摘要 + 权利要求"""
+def _extract_first_claim(claims_text: str) -> str:
+    """智能提取第一条独立权利要求
+
+    优先匹配 "1." / "1．" / "权利要求1" 等标记，
+    截取到 "2." / "2．" 标记为止；若无明确标记则取前 8000 字符。
+    """
+    if not claims_text:
+        return ""
+
+    # 尝试匹配以 "1." / "1．" / "权利要求1" 开头的首条权利要求
+    first_claim_pattern = re.compile(
+        r'(?:^|\n)\s*(?:1[.．]|权利要求\s*1[.．、:]?\s*)',
+        re.IGNORECASE,
+    )
+    match = first_claim_pattern.search(claims_text)
+    if match:
+        # 从匹配位置开始提取
+        start = match.start()
+        # 寻找第二条权利要求的起始位置
+        second_claim_pattern = re.compile(
+            r'(?:^|\n)\s*2[.．]',
+            re.IGNORECASE,
+        )
+        second_match = second_claim_pattern.search(claims_text, match.end())
+        if second_match:
+            return claims_text[start:second_match.start()].strip()
+        else:
+            # 没有找到第二条，取从匹配位置到末尾（不超过 8000 字符）
+            return claims_text[start:start + 8000].strip()
+
+    # 无明确标记，取前 8000 字符
+    return claims_text[:8000].strip()
+
+
+def build_title_abs_text(row: dict, mapping: dict[str, str | None]) -> str:
+    """构建标题+摘要文本（用于 title_abs_vec）"""
     parts = []
-    for field_key in ("title", "abstract", "claims"):
+    for field_key in ("title", "abstract"):
         col_name = mapping.get(field_key)
         if col_name and col_name in row:
             value = str(row[col_name]).strip()
@@ -61,23 +99,55 @@ def _build_text(row: dict, mapping: dict[str, str | None]) -> str:
     return "\n".join(parts)
 
 
+def build_claims_text(row: dict, mapping: dict[str, str | None]) -> str:
+    """构建权利要求文本（用于 claims_vec），仅取首条独立权利要求"""
+    col_name = mapping.get("claims")
+    if col_name and col_name in row:
+        claims = str(row[col_name]).strip()
+        if claims:
+            return _extract_first_claim(claims)
+    return ""
+
+
 def _generate_embeddings(
     texts: list[str],
     api_key: str,
     model_name: str,
     base_url: str,
+    dimensions: int = VECTOR_DIMENSION,
 ) -> list[list[float]]:
-    """调用 OpenAI 兼容接口生成向量"""
+    """调用 OpenAI 兼容接口生成向量，支持指定维度"""
     client = OpenAI(api_key=api_key, base_url=base_url)
-    response = client.embeddings.create(model=model_name, input=texts)
+    response = client.embeddings.create(
+        model=model_name,
+        input=texts,
+        dimensions=dimensions,
+    )
     # 按 index 排序确保顺序一致
     sorted_data = sorted(response.data, key=lambda x: x.index)
     return [item.embedding for item in sorted_data]
 
 
+def _build_doc(row: dict, mapping: dict[str, str | None], row_idx: int,
+               title_abs_vec: list[float], claims_vec: list[float]) -> zvec.Doc:
+    """构建单条文档"""
+    p_no = str(row.get(mapping.get("patent_no", ""), "")) or f"row_{row_idx}"
+    return zvec.Doc(
+        id=p_no,
+        vectors={"title_abs_vec": title_abs_vec, "claims_vec": claims_vec},
+        fields={
+            "patent_no": p_no,
+            "applicant": str(row.get(mapping.get("applicant"), "")),
+            "title": str(row.get(mapping.get("title"), "")),
+            "abstract": str(row.get(mapping.get("abstract"), "")),
+            "claims": str(row.get(mapping.get("claims"), "")),
+        },
+    )
+
+
 @router.post("", response_model=ImportResponse)
 def import_data(req: ImportRequest):
-    """从已上传的 Excel 文件导入数据到向量集合"""
+    """从已上传的 Excel 文件导入数据到向量集合（双向量策略）"""
     # 1. 读取上传的 JSON 数据
     json_path = UPLOAD_DIR / f"{req.upload_id}.json"
     if not json_path.exists():
@@ -92,43 +162,43 @@ def import_data(req: ImportRequest):
     # 2. 读取配置
     config = _read_config()
     api_key = config.get("api_key", "")
-    model_name = config.get("model_name", "text-embedding-v3")
-    base_url = config.get("base_url", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+    model_name = config.get("model_name", "Qwen/Qwen3-Embedding-0.6B")
+    base_url = config.get("base_url", "https://api.siliconflow.cn/v1")
 
     if not api_key:
         raise HTTPException(status_code=400, detail="API 密钥为空，请先在设置页面配置")
 
-    # 3. 先用一条数据探测向量维度
-    first_text = _build_text(rows[0], req.mapping)
-    if not first_text.strip():
-        raise HTTPException(status_code=400, detail="第一条数据拼接文本为空，请检查映射关系")
+    # 3. 用第一条数据探测向量维度，确保 API 连通
+    first_title_abs = build_title_abs_text(rows[0], req.mapping)
+    if not first_title_abs.strip():
+        raise HTTPException(status_code=400, detail="第一条数据的标题+摘要为空，请检查映射关系")
 
     try:
-        first_embeddings = _generate_embeddings([first_text], api_key, model_name, base_url)
+        first_title_abs_emb = _generate_embeddings(
+            [first_title_abs], api_key, model_name, base_url, dimensions=VECTOR_DIMENSION,
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"调用嵌入接口失败: {e}")
 
-    dimension = len(first_embeddings[0])
+    # 4. 获取或创建集合（固定 512 维）
+    collection = get_or_create_collection(VECTOR_DIMENSION)
 
-    # 4. 获取或创建集合
-    collection = get_or_create_collection(dimension)
+    # 5. 生成第一条数据的 claims 向量并插入
+    first_claims = build_claims_text(rows[0], req.mapping)
+    if first_claims.strip():
+        try:
+            first_claims_emb = _generate_embeddings(
+                [first_claims], api_key, model_name, base_url, dimensions=VECTOR_DIMENSION,
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"调用嵌入接口失败: {e}")
+    else:
+        # 权利要求为空时使用零向量
+        first_claims_emb = [[0.0] * VECTOR_DIMENSION]
 
-    # 5. 插入第一条数据
-    first_row = rows[0]
-    patent_no = str(first_row.get(req.mapping.get("patent_no", ""), "")) or f"row_0"
-    doc = zvec.Doc(
-        id=patent_no,
-        vectors={"embedding": first_embeddings[0]},
-        fields={
-            "patent_no": patent_no,
-            "applicant": str(first_row.get(req.mapping.get("applicant"), "")),
-            "title": str(first_row.get(req.mapping.get("title"), "")),
-            "abstract": str(first_row.get(req.mapping.get("abstract"), "")),
-            "claims": str(first_row.get(req.mapping.get("claims"), "")),
-        },
-    )
+    first_doc = _build_doc(rows[0], req.mapping, 0, first_title_abs_emb[0], first_claims_emb[0])
     try:
-        collection.insert(doc)
+        collection.insert(first_doc)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"插入数据失败: {e}")
 
@@ -140,27 +210,52 @@ def import_data(req: ImportRequest):
     total = len(rows)
 
     # 收集待处理的文本和行索引
-    batch_texts: list[str] = []
+    batch_title_abs: list[str] = []
+    batch_claims: list[str] = []
     batch_indices: list[int] = []
 
     for i, row in enumerate(remaining_rows, start=1):
-        text = _build_text(row, req.mapping)
-        if not text.strip():
+        title_abs = build_title_abs_text(row, req.mapping)
+        claims = build_claims_text(row, req.mapping)
+
+        # 标题+摘要为空则跳过
+        if not title_abs.strip():
             failed += 1
             continue
-        batch_texts.append(text)
+
+        batch_title_abs.append(title_abs)
+        batch_claims.append(claims if claims.strip() else "")
         batch_indices.append(i)
 
         # 达到 embedding 批量大小时调用接口
-        if len(batch_texts) >= EMBEDDING_BATCH_SIZE:
+        if len(batch_title_abs) >= EMBEDDING_BATCH_SIZE:
             try:
-                embeddings = _generate_embeddings(batch_texts, api_key, model_name, base_url)
+                title_abs_embeddings = _generate_embeddings(
+                    batch_title_abs, api_key, model_name, base_url, dimensions=VECTOR_DIMENSION,
+                )
+                # 仅对非空的 claims 生成向量
+                non_empty_claims = [t for t in batch_claims if t]
+                if non_empty_claims:
+                    claims_embeddings_raw = _generate_embeddings(
+                        non_empty_claims, api_key, model_name, base_url, dimensions=VECTOR_DIMENSION,
+                    )
+                    # 将非空 claims 向量按顺序映射回原位置
+                    claims_embeddings = []
+                    raw_idx = 0
+                    zero_vec = [0.0] * VECTOR_DIMENSION
+                    for t in batch_claims:
+                        if t:
+                            claims_embeddings.append(claims_embeddings_raw[raw_idx])
+                            raw_idx += 1
+                        else:
+                            claims_embeddings.append(zero_vec)
+                else:
+                    claims_embeddings = [[0.0] * VECTOR_DIMENSION] * len(batch_claims)
             except Exception as e:
-                # 嵌入接口失败，返回已导入的数量
                 return ImportResponse(
                     total=total,
                     imported=imported,
-                    failed=failed + len(batch_texts),
+                    failed=failed + len(batch_title_abs),
                     error=f"调用嵌入接口失败: {e}",
                 )
 
@@ -168,17 +263,10 @@ def import_data(req: ImportRequest):
             docs = []
             for idx_in_batch, row_idx in enumerate(batch_indices):
                 row = remaining_rows[row_idx - 1]
-                p_no = str(row.get(req.mapping.get("patent_no", ""), "")) or f"row_{row_idx}"
-                docs.append(zvec.Doc(
-                    id=p_no,
-                    vectors={"embedding": embeddings[idx_in_batch]},
-                    fields={
-                        "patent_no": p_no,
-                        "applicant": str(row.get(req.mapping.get("applicant"), "")),
-                        "title": str(row.get(req.mapping.get("title"), "")),
-                        "abstract": str(row.get(req.mapping.get("abstract"), "")),
-                        "claims": str(row.get(req.mapping.get("claims"), "")),
-                    },
+                docs.append(_build_doc(
+                    row, req.mapping, row_idx,
+                    title_abs_embeddings[idx_in_batch],
+                    claims_embeddings[idx_in_batch],
                 ))
 
             # 分批插入
@@ -196,35 +284,47 @@ def import_data(req: ImportRequest):
                         error=f"插入数据失败: {e}",
                     )
 
-            batch_texts = []
+            batch_title_abs = []
+            batch_claims = []
             batch_indices = []
 
     # 处理剩余不足一批的文本
-    if batch_texts:
+    if batch_title_abs:
         try:
-            embeddings = _generate_embeddings(batch_texts, api_key, model_name, base_url)
+            title_abs_embeddings = _generate_embeddings(
+                batch_title_abs, api_key, model_name, base_url, dimensions=VECTOR_DIMENSION,
+            )
+            non_empty_claims = [t for t in batch_claims if t]
+            if non_empty_claims:
+                claims_embeddings_raw = _generate_embeddings(
+                    non_empty_claims, api_key, model_name, base_url, dimensions=VECTOR_DIMENSION,
+                )
+                claims_embeddings = []
+                raw_idx = 0
+                zero_vec = [0.0] * VECTOR_DIMENSION
+                for t in batch_claims:
+                    if t:
+                        claims_embeddings.append(claims_embeddings_raw[raw_idx])
+                        raw_idx += 1
+                    else:
+                        claims_embeddings.append(zero_vec)
+            else:
+                claims_embeddings = [[0.0] * VECTOR_DIMENSION] * len(batch_claims)
         except Exception as e:
             return ImportResponse(
                 total=total,
                 imported=imported,
-                failed=failed + len(batch_texts),
+                failed=failed + len(batch_title_abs),
                 error=f"调用嵌入接口失败: {e}",
             )
 
         docs = []
         for idx_in_batch, row_idx in enumerate(batch_indices):
             row = remaining_rows[row_idx - 1]
-            p_no = str(row.get(req.mapping.get("patent_no", ""), "")) or f"row_{row_idx}"
-            docs.append(zvec.Doc(
-                id=p_no,
-                vectors={"embedding": embeddings[idx_in_batch]},
-                fields={
-                    "patent_no": p_no,
-                    "applicant": str(row.get(req.mapping.get("applicant"), "")),
-                    "title": str(row.get(req.mapping.get("title"), "")),
-                    "abstract": str(row.get(req.mapping.get("abstract"), "")),
-                    "claims": str(row.get(req.mapping.get("claims"), "")),
-                },
+            docs.append(_build_doc(
+                row, req.mapping, row_idx,
+                title_abs_embeddings[idx_in_batch],
+                claims_embeddings[idx_in_batch],
             ))
 
         for j in range(0, len(docs), INSERT_BATCH_SIZE):
@@ -252,7 +352,7 @@ def get_status():
         return StatusResponse(collection_exists=False, document_count=0, dimension=None)
 
     doc_count = collection.stats.doc_count
-    # 从 schema 中获取向量维度
+    # 从 schema 中获取向量维度（取第一个向量字段的维度）
     dimension = None
     vectors = collection.schema.vectors
     if vectors:

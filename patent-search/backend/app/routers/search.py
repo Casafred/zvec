@@ -1,4 +1,4 @@
-"""语义搜索路由"""
+"""语义搜索路由（双向量加权检索）"""
 import json
 from pathlib import Path
 
@@ -15,8 +15,19 @@ CONFIG_FILE = DATA_DIR / "config.json"
 DB_PATH = DATA_DIR / "patent_db"
 
 # 默认配置值
-DEFAULT_MODEL_NAME = "text-embedding-v3"
-DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+DEFAULT_MODEL_NAME = "Qwen/Qwen3-Embedding-0.6B"
+DEFAULT_BASE_URL = "https://api.siliconflow.cn/v1"
+
+# 向量维度（与导入保持一致）
+VECTOR_DIMENSION = 512
+
+# 双向量加权系数
+TITLE_ABS_WEIGHT = 0.6
+CLAIMS_WEIGHT = 0.4
+
+# 查询指令前缀
+TITLE_ABS_INSTRUCTION = "Retrieve the most relevant patents"
+CLAIMS_INSTRUCTION = "Find patents with similar claim scope"
 
 
 class SearchRequest(BaseModel):
@@ -56,8 +67,12 @@ def _read_config() -> dict:
         return json.load(f)
 
 
-def _get_embedding(text: str) -> list[float]:
-    """调用嵌入 API 将文本转为向量"""
+def _get_embedding(text: str, instruction: str | None = None) -> list[float]:
+    """调用嵌入 API 将文本转为向量
+
+    如果提供 instruction，则格式化为 "Instruct: {instruction}\\nQuery: {text}"；
+    否则直接使用 text 作为输入（用于文档侧嵌入）。
+    """
     config = _read_config()
     api_key = config.get("api_key", "")
     model_name = config.get("model_name", DEFAULT_MODEL_NAME)
@@ -66,20 +81,30 @@ def _get_embedding(text: str) -> list[float]:
     if not api_key:
         raise HTTPException(status_code=400, detail="API 密钥为空，请先配置")
 
+    if instruction:
+        input_text = f"Instruct: {instruction}\nQuery: {text}"
+    else:
+        input_text = text
+
     client = OpenAI(api_key=api_key, base_url=base_url)
-    response = client.embeddings.create(model=model_name, input=text)
+    response = client.embeddings.create(
+        model=model_name,
+        input=input_text,
+        dimensions=VECTOR_DIMENSION,
+    )
     return response.data[0].embedding
 
 
 @router.post("", response_model=SearchResponse)
 async def search(req: SearchRequest):
-    """语义搜索专利"""
+    """语义搜索专利（双向量加权检索）"""
     # 检查数据库是否存在
     if not DB_PATH.exists():
         raise HTTPException(status_code=404, detail="请先导入数据")
 
-    # 获取查询向量
-    query_vector = _get_embedding(req.query)
+    # 生成两组查询向量（带不同指令前缀）
+    title_abs_query_vec = _get_embedding(req.query, instruction=TITLE_ABS_INSTRUCTION)
+    claims_query_vec = _get_embedding(req.query, instruction=CLAIMS_INSTRUCTION)
 
     # 打开集合
     try:
@@ -87,31 +112,62 @@ async def search(req: SearchRequest):
     except Exception:
         raise HTTPException(status_code=404, detail="请先导入数据")
 
-    # 构建查询
-    query_obj = zvec.Query(field_name="embedding", vector=query_vector)
-
     # 构建过滤条件
     filter_expr = None
     if req.applicant:
         filter_expr = f"applicant == '{req.applicant}'"
 
-    # 执行查询
+    # 分别对两个向量字段执行查询，取更多候选以便融合排序
+    candidate_count = min(req.topk * 3, 100)
+
     try:
-        results = collection.query(
-            queries=query_obj,
-            topk=req.topk,
+        title_abs_results = collection.query(
+            queries=zvec.Query(field_name="title_abs_vec", vector=title_abs_query_vec),
+            topk=candidate_count,
             filter=filter_expr,
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"搜索失败: {e}")
+        raise HTTPException(status_code=500, detail=f"搜索标题摘要向量失败: {e}")
 
-    # 转换结果
-    hits = []
-    for doc in results:
-        fields = doc.fields or {}
-        hits.append(SearchHit(
-            id=doc.id,
-            score=doc.score if doc.score is not None else 0.0,
+    try:
+        claims_results = collection.query(
+            queries=zvec.Query(field_name="claims_vec", vector=claims_query_vec),
+            topk=candidate_count,
+            filter=filter_expr,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"搜索权利要求向量失败: {e}")
+
+    # 合并两组结果，使用加权分数
+    score_map: dict[str, dict] = {}
+
+    for doc in title_abs_results:
+        score_map[doc.id] = {
+            "id": doc.id,
+            "title_abs_score": doc.score if doc.score is not None else 0.0,
+            "claims_score": 0.0,
+            "fields": doc.fields or {},
+        }
+
+    for doc in claims_results:
+        if doc.id in score_map:
+            score_map[doc.id]["claims_score"] = doc.score if doc.score is not None else 0.0
+        else:
+            score_map[doc.id] = {
+                "id": doc.id,
+                "title_abs_score": 0.0,
+                "claims_score": doc.score if doc.score is not None else 0.0,
+                "fields": doc.fields or {},
+            }
+
+    # 计算加权最终分数并排序
+    merged = []
+    for doc_id, info in score_map.items():
+        final_score = TITLE_ABS_WEIGHT * info["title_abs_score"] + CLAIMS_WEIGHT * info["claims_score"]
+        fields = info["fields"]
+        merged.append(SearchHit(
+            id=doc_id,
+            score=final_score,
             patent_no=str(fields.get("patent_no", "")),
             applicant=str(fields.get("applicant", "")),
             title=str(fields.get("title", "")),
@@ -119,7 +175,9 @@ async def search(req: SearchRequest):
             claims=str(fields.get("claims", "")),
         ))
 
-    return SearchResponse(results=hits)
+    merged.sort(key=lambda x: x.score, reverse=True)
+
+    return SearchResponse(results=merged[:req.topk])
 
 
 @router.get("/status", response_model=StatusResponse)

@@ -13,8 +13,8 @@ CONFIG_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
 # 默认配置值
-DEFAULT_MODEL_NAME = "text-embedding-v3"
-DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+DEFAULT_MODEL_NAME = "Qwen/Qwen3-Embedding-0.6B"
+DEFAULT_BASE_URL = "https://api.siliconflow.cn/v1"
 
 
 class ConfigRequest(BaseModel):
@@ -108,6 +108,7 @@ async def validate_config():
         response = client.embeddings.create(
             model=model_name,
             input="测试",
+            dimensions=512,
         )
         dimension = len(response.data[0].embedding)
         return ValidateResponse(valid=True, dimension=dimension)

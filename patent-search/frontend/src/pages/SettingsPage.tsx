@@ -26,8 +26,8 @@ interface ValidateResponse {
 function SettingsPage() {
   const [form, setForm] = useState<ConfigForm>({
     api_key: "",
-    model_name: "text-embedding-v3",
-    base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    model_name: "Qwen/Qwen3-Embedding-0.6B",
+    base_url: "https://api.siliconflow.cn/v1",
   })
   const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null)
   const [validating, setValidating] = useState(false)
@@ -40,8 +40,8 @@ function SettingsPage() {
       .then((res) => {
         setForm({
           api_key: res.data.api_key || "",
-          model_name: res.data.model_name || "text-embedding-v3",
-          base_url: res.data.base_url || "https://dashscope.aliyuncs.com/compatible-mode/v1",
+          model_name: res.data.model_name || "Qwen/Qwen3-Embedding-0.6B",
+          base_url: res.data.base_url || "https://api.siliconflow.cn/v1",
         })
       })
       .catch(() => {
@@ -125,7 +125,7 @@ function SettingsPage() {
             type="text"
             value={form.model_name}
             onChange={(e) => setForm({ ...form, model_name: e.target.value })}
-            placeholder="text-embedding-v3"
+            placeholder="Qwen/Qwen3-Embedding-0.6B"
             style={{
               width: "100%",
               padding: "8px 12px",
@@ -148,7 +148,7 @@ function SettingsPage() {
             type="text"
             value={form.base_url}
             onChange={(e) => setForm({ ...form, base_url: e.target.value })}
-            placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1"
+            placeholder="https://api.siliconflow.cn/v1"
             style={{
               width: "100%",
               padding: "8px 12px",
