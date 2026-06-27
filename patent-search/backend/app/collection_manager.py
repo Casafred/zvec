@@ -12,7 +12,7 @@ _collection: zvec.Collection | None = None
 
 
 def _build_schema(dimension: int = 512) -> zvec.CollectionSchema:
-    """构建专利集合的 schema（三向量：标题摘要 + 说明书 + 权利要求）"""
+    """构建专利集合的 schema（三向量 + BM25稀疏向量：标题摘要 + 说明书 + 权利要求 + 关键词）"""
     return zvec.CollectionSchema(
         name=COLLECTION_NAME,
         fields=[
@@ -47,6 +47,12 @@ def _build_schema(dimension: int = 512) -> zvec.CollectionSchema:
                 index_param=zvec.HnswIndexParam(
                     metric_type=zvec.MetricType.COSINE,
                 ),
+            ),
+            zvec.VectorSchema(
+                "bm25_vec",
+                zvec.DataType.SPARSE_VECTOR_FP32,
+                metric_type=zvec.MetricType.IP,
+                index_type=zvec.IndexType.FLAT,
             ),
         ],
     )

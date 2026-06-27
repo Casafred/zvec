@@ -1,6 +1,7 @@
 fastapi
 uvicorn[standard]
 zvec
+dashtext
 pandas
 openpyxl
 openai

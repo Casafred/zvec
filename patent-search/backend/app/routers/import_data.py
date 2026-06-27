@@ -1,4 +1,4 @@
-"""数据导入路由（三向量：标题摘要 + 说明书 + 权利要求）"""
+"""数据导入路由（三向量 + BM25稀疏向量：标题摘要 + 说明书 + 权利要求 + 关键词）"""
 import json
 import re
 from pathlib import Path
@@ -22,6 +22,21 @@ INSERT_BATCH_SIZE = 100
 
 # 向量维度（Qwen3-Embedding-0.6B 固定使用 512 维）
 VECTOR_DIMENSION = 512
+
+# BM25 稀疏向量生成器（延迟初始化，避免 dashtext 不兼容时整个模块无法导入）
+_bm25_doc_fn = None
+
+
+def _get_bm25_doc_fn():
+    """获取 BM25 文档编码器（延迟初始化）"""
+    global _bm25_doc_fn
+    if _bm25_doc_fn is None:
+        try:
+            from zvec.extension import BM25EmbeddingFunction
+            _bm25_doc_fn = BM25EmbeddingFunction(language="zh", encoding_type="document")
+        except ImportError:
+            pass  # dashtext 未安装时跳过 BM25
+    return _bm25_doc_fn
 
 
 class ImportRequest(BaseModel):
@@ -171,6 +186,28 @@ def build_claims_text(row: dict, mapping: dict[str, str | None]) -> str:
     return ""
 
 
+def build_bm25_text(row: dict, mapping: dict[str, str | None]) -> str:
+    """构建 BM25 文本（标题 + 摘要 + 首条权利要求），用于生成稀疏向量"""
+    parts = []
+    # 标题
+    col_name = mapping.get("title")
+    if col_name and col_name in row:
+        value = str(row[col_name]).strip()
+        if value:
+            parts.append(value)
+    # 摘要
+    col_name = mapping.get("abstract")
+    if col_name and col_name in row:
+        value = str(row[col_name]).strip()
+        if value:
+            parts.append(value)
+    # 首条权利要求
+    claims_text = build_claims_text(row, mapping)
+    if claims_text:
+        parts.append(claims_text)
+    return "\n".join(parts)
+
+
 def _generate_embeddings(
     texts: list[str],
     api_key: str,
@@ -191,12 +228,18 @@ def _generate_embeddings(
 
 
 def _build_doc(row: dict, mapping: dict[str, str | None], row_idx: int,
-               title_abs_vec: list[float], desc_vec: list[float], claims_vec: list[float]) -> zvec.Doc:
-    """构建单条文档"""
+               title_abs_vec: list[float], desc_vec: list[float], claims_vec: list[float],
+               bm25_vec: dict[int, float]) -> zvec.Doc:
+    """构建单条文档（含 BM25 稀疏向量）"""
     p_no = str(row.get(mapping.get("patent_no", ""), "")) or f"row_{row_idx}"
     return zvec.Doc(
         id=p_no,
-        vectors={"title_abs_vec": title_abs_vec, "desc_vec": desc_vec, "claims_vec": claims_vec},
+        vectors={
+            "title_abs_vec": title_abs_vec,
+            "desc_vec": desc_vec,
+            "claims_vec": claims_vec,
+            "bm25_vec": bm25_vec,
+        },
         fields={
             "patent_no": p_no,
             "applicant": str(row.get(mapping.get("applicant"), "")),
@@ -271,9 +314,14 @@ def import_data(req: ImportRequest):
     else:
         first_claims_emb = [zero_vec]
 
+    # BM25 稀疏向量
+    bm25_fn = _get_bm25_doc_fn()
+    first_bm25_vec = bm25_fn.embed(build_bm25_text(rows[0], req.mapping)) if bm25_fn else {}
+
     first_doc = _build_doc(
         rows[0], req.mapping, 0,
         first_title_abs_emb[0], first_desc_emb[0], first_claims_emb[0],
+        first_bm25_vec,
     )
     try:
         collection.insert(first_doc)
@@ -286,11 +334,13 @@ def import_data(req: ImportRequest):
     # 6. 批量处理剩余数据
     remaining_rows = rows[1:]
     total = len(rows)
+    bm25_fn = _get_bm25_doc_fn()  # 缓存，避免循环中重复初始化
 
     # 收集待处理的文本和行索引
     batch_title_abs: list[str] = []
     batch_desc: list[str] = []
     batch_claims: list[str] = []
+    batch_bm25: list[str] = []
     batch_indices: list[int] = []
 
     def _embed_with_zero_fallback(texts: list[str], api_key: str, model_name: str, base_url: str) -> list[list[float]]:
@@ -313,6 +363,7 @@ def import_data(req: ImportRequest):
         title_abs = build_title_abs_text(row, req.mapping)
         desc = build_desc_text(row, req.mapping)
         claims = build_claims_text(row, req.mapping)
+        bm25_text = build_bm25_text(row, req.mapping)
 
         # 标题+摘要为空则跳过
         if not title_abs.strip():
@@ -322,6 +373,7 @@ def import_data(req: ImportRequest):
         batch_title_abs.append(title_abs)
         batch_desc.append(desc if desc.strip() else "")
         batch_claims.append(claims if claims.strip() else "")
+        batch_bm25.append(bm25_text)
         batch_indices.append(i)
 
         # 达到 embedding 批量大小时调用接口
@@ -348,11 +400,13 @@ def import_data(req: ImportRequest):
             docs = []
             for idx_in_batch, row_idx in enumerate(batch_indices):
                 row = remaining_rows[row_idx - 1]
+                bm25_vec = bm25_fn.embed(batch_bm25[idx_in_batch]) if bm25_fn else {}
                 docs.append(_build_doc(
                     row, req.mapping, row_idx,
                     title_abs_embeddings[idx_in_batch],
                     desc_embeddings[idx_in_batch],
                     claims_embeddings[idx_in_batch],
+                    bm25_vec,
                 ))
 
             # 分批插入
@@ -373,6 +427,7 @@ def import_data(req: ImportRequest):
             batch_title_abs = []
             batch_desc = []
             batch_claims = []
+            batch_bm25 = []
             batch_indices = []
 
     # 处理剩余不足一批的文本
@@ -398,11 +453,13 @@ def import_data(req: ImportRequest):
         docs = []
         for idx_in_batch, row_idx in enumerate(batch_indices):
             row = remaining_rows[row_idx - 1]
+            bm25_vec = _get_bm25_doc_fn().embed(batch_bm25[idx_in_batch])
             docs.append(_build_doc(
                 row, req.mapping, row_idx,
                 title_abs_embeddings[idx_in_batch],
                 desc_embeddings[idx_in_batch],
                 claims_embeddings[idx_in_batch],
+                bm25_vec,
             ))
 
         for j in range(0, len(docs), INSERT_BATCH_SIZE):

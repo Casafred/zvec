@@ -1,4 +1,4 @@
-"""语义搜索路由（三向量加权检索，支持自定义权重和字段开关）"""
+"""语义搜索路由（混合检索：密集向量 + BM25稀疏向量，使用 multi_query + WeightedReRanker）"""
 import json
 from pathlib import Path
 
@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException
 from openai import OpenAI
 from pydantic import BaseModel, Field
 import zvec
+from zvec import Query
 
 router = APIRouter(prefix="/api/search", tags=["搜索"])
 
@@ -21,10 +22,11 @@ DEFAULT_BASE_URL = "https://api.siliconflow.cn/v1"
 # 向量维度（与导入保持一致）
 VECTOR_DIMENSION = 512
 
-# 默认加权系数（权利要求和摘要最重，说明书次要）
-DEFAULT_TITLE_ABS_WEIGHT = 0.45
-DEFAULT_DESC_WEIGHT = 0.15
-DEFAULT_CLAIMS_WEIGHT = 0.40
+# 默认加权系数（标题摘要和权利要求最重，BM25关键词次之，说明书辅助）
+DEFAULT_TITLE_ABS_WEIGHT = 0.40
+DEFAULT_DESC_WEIGHT = 0.10
+DEFAULT_CLAIMS_WEIGHT = 0.30
+DEFAULT_BM25_WEIGHT = 0.20
 
 # 查询指令前缀
 TITLE_ABS_INSTRUCTION = "Retrieve the most relevant patents"
@@ -51,6 +53,11 @@ VECTOR_FIELDS = {
         "default_weight": DEFAULT_CLAIMS_WEIGHT,
         "label": "权利要求",
     },
+    "bm25": {
+        "field_name": "bm25_vec",
+        "default_weight": DEFAULT_BM25_WEIGHT,
+        "label": "关键词(BM25)",
+    },
 }
 
 
@@ -63,10 +70,12 @@ class SearchRequest(BaseModel):
     use_title_abs: bool = Field(default=True, description="是否使用标题+摘要向量")
     use_desc: bool = Field(default=True, description="是否使用说明书向量")
     use_claims: bool = Field(default=True, description="是否使用权利要求向量")
+    use_bm25: bool = Field(default=True, description="是否使用BM25关键词向量")
     # 自定义权重（仅在开关开启时生效）
     weight_title_abs: float = Field(default=DEFAULT_TITLE_ABS_WEIGHT, description="标题+摘要权重")
     weight_desc: float = Field(default=DEFAULT_DESC_WEIGHT, description="说明书权重")
     weight_claims: float = Field(default=DEFAULT_CLAIMS_WEIGHT, description="权利要求权重")
+    weight_bm25: float = Field(default=DEFAULT_BM25_WEIGHT, description="BM25关键词权重")
 
 
 class SearchHit(BaseModel):
@@ -133,42 +142,68 @@ def _get_embedding(text: str, instruction: str | None = None) -> list[float]:
     return response.data[0].embedding
 
 
-def _normalize_weights(weights: dict[str, float]) -> dict[str, float]:
-    """归一化权重，使总和为 1"""
-    total = sum(weights.values())
+def _normalize_weights(weights: list[float]) -> list[float]:
+    """归一化权重列表，使总和为 1"""
+    total = sum(weights)
     if total <= 0:
-        # 如果全为 0，均分
         n = len(weights)
-        return {k: 1.0 / n for k in weights} if n > 0 else weights
-    return {k: v / total for k, v in weights.items()}
+        return [1.0 / n for _ in weights] if n > 0 else weights
+    return [w / total for w in weights]
+
+
+# BM25 查询向量生成器（延迟初始化）
+_bm25_query_fn = None
+
+
+def _get_bm25_query_fn():
+    """获取 BM25 查询编码器（延迟初始化）"""
+    global _bm25_query_fn
+    if _bm25_query_fn is None:
+        try:
+            from zvec.extension import BM25EmbeddingFunction
+            _bm25_query_fn = BM25EmbeddingFunction(language="zh", encoding_type="query")
+        except ImportError:
+            pass  # dashtext 未安装时跳过 BM25
+    return _bm25_query_fn
 
 
 @router.post("", response_model=SearchResponse)
 async def search(req: SearchRequest):
-    """语义搜索专利（三向量加权检索，支持自定义权重和字段开关）"""
+    """混合检索专利（密集向量 + BM25稀疏向量，使用 multi_query + WeightedReRanker）"""
     if not DB_PATH.exists():
         raise HTTPException(status_code=404, detail="请先导入数据")
 
-    # 构建启用的向量字段列表及其权重
-    enabled_fields: dict[str, dict] = {}
-    if req.use_title_abs:
-        enabled_fields["title_abs"] = {"weight": req.weight_title_abs, **VECTOR_FIELDS["title_abs"]}
-    if req.use_desc:
-        enabled_fields["desc"] = {"weight": req.weight_desc, **VECTOR_FIELDS["desc"]}
-    if req.use_claims:
-        enabled_fields["claims"] = {"weight": req.weight_claims, **VECTOR_FIELDS["claims"]}
+    # 构建 queries 列表和对应权重
+    queries: list[Query] = []
+    weights: list[float] = []
 
-    if not enabled_fields:
+    if req.use_title_abs:
+        title_abs_vec = _get_embedding(req.query, instruction=TITLE_ABS_INSTRUCTION)
+        queries.append(Query(field_name="title_abs_vec", vector=title_abs_vec))
+        weights.append(req.weight_title_abs)
+
+    if req.use_desc:
+        desc_vec = _get_embedding(req.query, instruction=DESC_INSTRUCTION)
+        queries.append(Query(field_name="desc_vec", vector=desc_vec))
+        weights.append(req.weight_desc)
+
+    if req.use_claims:
+        claims_vec = _get_embedding(req.query, instruction=CLAIMS_INSTRUCTION)
+        queries.append(Query(field_name="claims_vec", vector=claims_vec))
+        weights.append(req.weight_claims)
+
+    if req.use_bm25:
+        bm25_fn = _get_bm25_query_fn()
+        if bm25_fn is not None:
+            bm25_vec = bm25_fn.embed(req.query)
+            queries.append(Query(field_name="bm25_vec", vector=bm25_vec))
+            weights.append(req.weight_bm25)
+
+    if not queries:
         raise HTTPException(status_code=400, detail="请至少启用一个向量字段")
 
     # 归一化权重
-    raw_weights = {k: v["weight"] for k, v in enabled_fields.items()}
-    norm_weights = _normalize_weights(raw_weights)
-
-    # 为每个启用的字段生成查询向量
-    query_vectors: dict[str, list[float]] = {}
-    for key, cfg in enabled_fields.items():
-        query_vectors[key] = _get_embedding(req.query, instruction=cfg["instruction"])
+    norm_weights = _normalize_weights(weights)
 
     # 打开集合
     try:
@@ -181,44 +216,25 @@ async def search(req: SearchRequest):
     if req.applicant:
         filter_expr = f"applicant == '{req.applicant}'"
 
-    candidate_count = min(req.topk * 3, 100)
+    # 使用 multi_query + WeightedReRanker 执行混合检索
+    try:
+        from zvec.extension import WeightedReRanker
+        results = collection.query(
+            queries=queries,
+            topk=req.topk,
+            filter=filter_expr,
+            reranker=WeightedReRanker(norm_weights),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"搜索失败: {e}")
 
-    # 对每个启用的字段执行查询
-    field_results: dict[str, list] = {}
-    for key, cfg in enabled_fields.items():
-        try:
-            results = collection.query(
-                queries=zvec.Query(field_name=cfg["field_name"], vector=query_vectors[key]),
-                topk=candidate_count,
-                filter=filter_expr,
-            )
-            field_results[key] = results
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"搜索{cfg['label']}向量失败: {e}")
-
-    # 合并结果，使用加权分数
-    score_map: dict[str, dict] = {}
-
-    for key, docs in field_results.items():
-        for doc in docs:
-            score_key = f"{key}_score"
-            if doc.id not in score_map:
-                score_map[doc.id] = {"id": doc.id, "fields": doc.fields or {}}
-                # 初始化所有字段分数为 0
-                for k in enabled_fields:
-                    score_map[doc.id][f"{k}_score"] = 0.0
-            score_map[doc.id][score_key] = doc.score if doc.score is not None else 0.0
-
-    # 计算加权最终分数
-    merged = []
-    for doc_id, info in score_map.items():
-        final_score = 0.0
-        for key in enabled_fields:
-            final_score += norm_weights[key] * info.get(f"{key}_score", 0.0)
-        fields = info["fields"]
-        merged.append(SearchHit(
-            id=doc_id,
-            score=final_score,
+    # 转换结果
+    hits = []
+    for doc in results:
+        fields = doc.fields or {}
+        hits.append(SearchHit(
+            id=doc.id,
+            score=doc.score if doc.score is not None else 0.0,
             patent_no=str(fields.get("patent_no", "")),
             applicant=str(fields.get("applicant", "")),
             title=str(fields.get("title", "")),
@@ -227,8 +243,7 @@ async def search(req: SearchRequest):
             claims=str(fields.get("claims", "")),
         ))
 
-    merged.sort(key=lambda x: x.score, reverse=True)
-    return SearchResponse(results=merged[:req.topk])
+    return SearchResponse(results=hits)
 
 
 @router.get("/status", response_model=StatusResponse)

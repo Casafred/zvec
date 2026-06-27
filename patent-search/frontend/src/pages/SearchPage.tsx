@@ -64,9 +64,10 @@ function SearchPage() {
 
   // 向量字段配置
   const [vectorFields, setVectorFields] = useState<VectorFieldConfig[]>([
-    { key: "title_abs", label: "标题+摘要", enabled: true, weight: 0.45 },
-    { key: "desc", label: "说明书", enabled: true, weight: 0.15 },
-    { key: "claims", label: "权利要求", enabled: true, weight: 0.40 },
+    { key: "title_abs", label: "标题+摘要", enabled: true, weight: 0.40 },
+    { key: "desc", label: "说明书", enabled: true, weight: 0.10 },
+    { key: "claims", label: "权利要求", enabled: true, weight: 0.30 },
+    { key: "bm25", label: "关键词(BM25)", enabled: true, weight: 0.20 },
   ])
 
   // 高级设置面板开关
