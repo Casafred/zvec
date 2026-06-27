@@ -8,6 +8,7 @@ const PATENT_FIELDS = [
   { key: 'applicant', label: '申请人' },
   { key: 'title', label: '标题' },
   { key: 'abstract', label: '摘要' },
+  { key: 'description', label: '说明书' },
   { key: 'claims', label: '权利要求' },
 ] as const
 

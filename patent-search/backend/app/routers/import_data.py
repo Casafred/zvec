@@ -1,4 +1,4 @@
-"""数据导入路由（双向量：标题摘要 + 权利要求）"""
+"""数据导入路由（三向量：标题摘要 + 说明书 + 权利要求）"""
 import json
 import re
 from pathlib import Path
@@ -99,6 +99,68 @@ def build_title_abs_text(row: dict, mapping: dict[str, str | None]) -> str:
     return "\n".join(parts)
 
 
+# 说明书关键章节正则
+_DESC_SECTION_PATTERN = re.compile(
+    r'(?:技术领域|背景技术|发明内容|具体实施方式|实施例)',
+    re.IGNORECASE,
+)
+
+
+def _extract_desc_key_sections(desc_text: str, max_chars: int = 16000) -> str:
+    """智能提取说明书关键章节
+
+    策略：
+    1. 优先提取"发明内容"章节（通常包含技术方案核心）
+    2. 若无明确章节标记，取前 max_chars 字符
+    3. 总长度不超过 max_chars（约 8000 token，留足 32K 上限余量）
+    """
+    if not desc_text:
+        return ""
+
+    # 尝试提取"发明内容"章节：从"发明内容"到下一个章节标题
+    invention_pattern = re.compile(
+        r'发明内容[：:\s]*\n?(.*?)(?=(?:技术领域|背景技术|附图说明|具体实施方式|实施例|权利要求|$))',
+        re.IGNORECASE | re.DOTALL,
+    )
+    invention_match = invention_pattern.search(desc_text)
+    invention_section = invention_match.group(1).strip() if invention_match else ""
+
+    # 尝试提取"具体实施方式"的前部分
+    impl_pattern = re.compile(
+        r'具体实施方式[：:\s]*\n?(.*?)(?=(?:附图说明|权利要求|$))',
+        re.IGNORECASE | re.DOTALL,
+    )
+    impl_match = impl_pattern.search(desc_text)
+    impl_section = ""
+    if impl_match:
+        # 具体实施方式可能极长，只取前 8000 字符
+        impl_section = impl_match.group(1).strip()[:8000]
+
+    # 组合：发明内容 + 具体实施方式（前部分）
+    if invention_section and impl_section:
+        combined = f"发明内容：\n{invention_section}\n\n具体实施方式：\n{impl_section}"
+    elif invention_section:
+        combined = f"发明内容：\n{invention_section}"
+    elif impl_section:
+        combined = f"具体实施方式：\n{impl_section}"
+    else:
+        # 无明确章节标记，取前 max_chars 字符
+        combined = desc_text[:max_chars].strip()
+
+    # 最终截断保护
+    return combined[:max_chars]
+
+
+def build_desc_text(row: dict, mapping: dict[str, str | None]) -> str:
+    """构建说明书文本（用于 desc_vec），提取关键章节"""
+    col_name = mapping.get("description")
+    if col_name and col_name in row:
+        desc = str(row[col_name]).strip()
+        if desc:
+            return _extract_desc_key_sections(desc)
+    return ""
+
+
 def build_claims_text(row: dict, mapping: dict[str, str | None]) -> str:
     """构建权利要求文本（用于 claims_vec），仅取首条独立权利要求"""
     col_name = mapping.get("claims")
@@ -129,17 +191,18 @@ def _generate_embeddings(
 
 
 def _build_doc(row: dict, mapping: dict[str, str | None], row_idx: int,
-               title_abs_vec: list[float], claims_vec: list[float]) -> zvec.Doc:
+               title_abs_vec: list[float], desc_vec: list[float], claims_vec: list[float]) -> zvec.Doc:
     """构建单条文档"""
     p_no = str(row.get(mapping.get("patent_no", ""), "")) or f"row_{row_idx}"
     return zvec.Doc(
         id=p_no,
-        vectors={"title_abs_vec": title_abs_vec, "claims_vec": claims_vec},
+        vectors={"title_abs_vec": title_abs_vec, "desc_vec": desc_vec, "claims_vec": claims_vec},
         fields={
             "patent_no": p_no,
             "applicant": str(row.get(mapping.get("applicant"), "")),
             "title": str(row.get(mapping.get("title"), "")),
             "abstract": str(row.get(mapping.get("abstract"), "")),
+            "description": str(row.get(mapping.get("description"), "")),
             "claims": str(row.get(mapping.get("claims"), "")),
         },
     )
@@ -147,7 +210,7 @@ def _build_doc(row: dict, mapping: dict[str, str | None], row_idx: int,
 
 @router.post("", response_model=ImportResponse)
 def import_data(req: ImportRequest):
-    """从已上传的 Excel 文件导入数据到向量集合（双向量策略）"""
+    """从已上传的 Excel 文件导入数据到向量集合（三向量策略）"""
     # 1. 读取上传的 JSON 数据
     json_path = UPLOAD_DIR / f"{req.upload_id}.json"
     if not json_path.exists():
@@ -168,7 +231,7 @@ def import_data(req: ImportRequest):
     if not api_key:
         raise HTTPException(status_code=400, detail="API 密钥为空，请先在设置页面配置")
 
-    # 3. 用第一条数据探测向量维度，确保 API 连通
+    # 3. 用第一条数据探测 API 连通性
     first_title_abs = build_title_abs_text(rows[0], req.mapping)
     if not first_title_abs.strip():
         raise HTTPException(status_code=400, detail="第一条数据的标题+摘要为空，请检查映射关系")
@@ -183,7 +246,20 @@ def import_data(req: ImportRequest):
     # 4. 获取或创建集合（固定 512 维）
     collection = get_or_create_collection(VECTOR_DIMENSION)
 
-    # 5. 生成第一条数据的 claims 向量并插入
+    # 5. 生成第一条数据的 desc 和 claims 向量并插入
+    zero_vec = [0.0] * VECTOR_DIMENSION
+
+    first_desc = build_desc_text(rows[0], req.mapping)
+    if first_desc.strip():
+        try:
+            first_desc_emb = _generate_embeddings(
+                [first_desc], api_key, model_name, base_url, dimensions=VECTOR_DIMENSION,
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"调用嵌入接口失败: {e}")
+    else:
+        first_desc_emb = [zero_vec]
+
     first_claims = build_claims_text(rows[0], req.mapping)
     if first_claims.strip():
         try:
@@ -193,10 +269,12 @@ def import_data(req: ImportRequest):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"调用嵌入接口失败: {e}")
     else:
-        # 权利要求为空时使用零向量
-        first_claims_emb = [[0.0] * VECTOR_DIMENSION]
+        first_claims_emb = [zero_vec]
 
-    first_doc = _build_doc(rows[0], req.mapping, 0, first_title_abs_emb[0], first_claims_emb[0])
+    first_doc = _build_doc(
+        rows[0], req.mapping, 0,
+        first_title_abs_emb[0], first_desc_emb[0], first_claims_emb[0],
+    )
     try:
         collection.insert(first_doc)
     except Exception as e:
@@ -211,11 +289,29 @@ def import_data(req: ImportRequest):
 
     # 收集待处理的文本和行索引
     batch_title_abs: list[str] = []
+    batch_desc: list[str] = []
     batch_claims: list[str] = []
     batch_indices: list[int] = []
 
+    def _embed_with_zero_fallback(texts: list[str], api_key: str, model_name: str, base_url: str) -> list[list[float]]:
+        """对非空文本生成向量，空文本用零向量填充"""
+        non_empty = [t for t in texts if t]
+        if not non_empty:
+            return [zero_vec] * len(texts)
+        raw = _generate_embeddings(non_empty, api_key, model_name, base_url, dimensions=VECTOR_DIMENSION)
+        result = []
+        raw_idx = 0
+        for t in texts:
+            if t:
+                result.append(raw[raw_idx])
+                raw_idx += 1
+            else:
+                result.append(zero_vec)
+        return result
+
     for i, row in enumerate(remaining_rows, start=1):
         title_abs = build_title_abs_text(row, req.mapping)
+        desc = build_desc_text(row, req.mapping)
         claims = build_claims_text(row, req.mapping)
 
         # 标题+摘要为空则跳过
@@ -224,6 +320,7 @@ def import_data(req: ImportRequest):
             continue
 
         batch_title_abs.append(title_abs)
+        batch_desc.append(desc if desc.strip() else "")
         batch_claims.append(claims if claims.strip() else "")
         batch_indices.append(i)
 
@@ -233,24 +330,12 @@ def import_data(req: ImportRequest):
                 title_abs_embeddings = _generate_embeddings(
                     batch_title_abs, api_key, model_name, base_url, dimensions=VECTOR_DIMENSION,
                 )
-                # 仅对非空的 claims 生成向量
-                non_empty_claims = [t for t in batch_claims if t]
-                if non_empty_claims:
-                    claims_embeddings_raw = _generate_embeddings(
-                        non_empty_claims, api_key, model_name, base_url, dimensions=VECTOR_DIMENSION,
-                    )
-                    # 将非空 claims 向量按顺序映射回原位置
-                    claims_embeddings = []
-                    raw_idx = 0
-                    zero_vec = [0.0] * VECTOR_DIMENSION
-                    for t in batch_claims:
-                        if t:
-                            claims_embeddings.append(claims_embeddings_raw[raw_idx])
-                            raw_idx += 1
-                        else:
-                            claims_embeddings.append(zero_vec)
-                else:
-                    claims_embeddings = [[0.0] * VECTOR_DIMENSION] * len(batch_claims)
+                desc_embeddings = _embed_with_zero_fallback(
+                    batch_desc, api_key, model_name, base_url,
+                )
+                claims_embeddings = _embed_with_zero_fallback(
+                    batch_claims, api_key, model_name, base_url,
+                )
             except Exception as e:
                 return ImportResponse(
                     total=total,
@@ -266,6 +351,7 @@ def import_data(req: ImportRequest):
                 docs.append(_build_doc(
                     row, req.mapping, row_idx,
                     title_abs_embeddings[idx_in_batch],
+                    desc_embeddings[idx_in_batch],
                     claims_embeddings[idx_in_batch],
                 ))
 
@@ -285,6 +371,7 @@ def import_data(req: ImportRequest):
                     )
 
             batch_title_abs = []
+            batch_desc = []
             batch_claims = []
             batch_indices = []
 
@@ -294,22 +381,12 @@ def import_data(req: ImportRequest):
             title_abs_embeddings = _generate_embeddings(
                 batch_title_abs, api_key, model_name, base_url, dimensions=VECTOR_DIMENSION,
             )
-            non_empty_claims = [t for t in batch_claims if t]
-            if non_empty_claims:
-                claims_embeddings_raw = _generate_embeddings(
-                    non_empty_claims, api_key, model_name, base_url, dimensions=VECTOR_DIMENSION,
-                )
-                claims_embeddings = []
-                raw_idx = 0
-                zero_vec = [0.0] * VECTOR_DIMENSION
-                for t in batch_claims:
-                    if t:
-                        claims_embeddings.append(claims_embeddings_raw[raw_idx])
-                        raw_idx += 1
-                    else:
-                        claims_embeddings.append(zero_vec)
-            else:
-                claims_embeddings = [[0.0] * VECTOR_DIMENSION] * len(batch_claims)
+            desc_embeddings = _embed_with_zero_fallback(
+                batch_desc, api_key, model_name, base_url,
+            )
+            claims_embeddings = _embed_with_zero_fallback(
+                batch_claims, api_key, model_name, base_url,
+            )
         except Exception as e:
             return ImportResponse(
                 total=total,
@@ -324,6 +401,7 @@ def import_data(req: ImportRequest):
             docs.append(_build_doc(
                 row, req.mapping, row_idx,
                 title_abs_embeddings[idx_in_batch],
+                desc_embeddings[idx_in_batch],
                 claims_embeddings[idx_in_batch],
             ))
 

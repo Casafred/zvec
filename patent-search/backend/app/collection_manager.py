@@ -12,7 +12,7 @@ _collection: zvec.Collection | None = None
 
 
 def _build_schema(dimension: int = 512) -> zvec.CollectionSchema:
-    """构建专利集合的 schema（双向量：标题摘要 + 权利要求）"""
+    """构建专利集合的 schema（三向量：标题摘要 + 说明书 + 权利要求）"""
     return zvec.CollectionSchema(
         name=COLLECTION_NAME,
         fields=[
@@ -20,11 +20,20 @@ def _build_schema(dimension: int = 512) -> zvec.CollectionSchema:
             zvec.FieldSchema("applicant", zvec.DataType.STRING),
             zvec.FieldSchema("title", zvec.DataType.STRING),
             zvec.FieldSchema("abstract", zvec.DataType.STRING),
+            zvec.FieldSchema("description", zvec.DataType.STRING),
             zvec.FieldSchema("claims", zvec.DataType.STRING),
         ],
         vectors=[
             zvec.VectorSchema(
                 "title_abs_vec",
+                zvec.DataType.VECTOR_FP32,
+                dimension=dimension,
+                index_param=zvec.HnswIndexParam(
+                    metric_type=zvec.MetricType.COSINE,
+                ),
+            ),
+            zvec.VectorSchema(
+                "desc_vec",
                 zvec.DataType.VECTOR_FP32,
                 dimension=dimension,
                 index_param=zvec.HnswIndexParam(

@@ -1,4 +1,4 @@
-"""语义搜索路由（双向量加权检索）"""
+"""语义搜索路由（三向量加权检索）"""
 import json
 from pathlib import Path
 
@@ -21,12 +21,14 @@ DEFAULT_BASE_URL = "https://api.siliconflow.cn/v1"
 # 向量维度（与导入保持一致）
 VECTOR_DIMENSION = 512
 
-# 双向量加权系数
-TITLE_ABS_WEIGHT = 0.6
-CLAIMS_WEIGHT = 0.4
+# 三向量加权系数
+TITLE_ABS_WEIGHT = 0.4
+DESC_WEIGHT = 0.35
+CLAIMS_WEIGHT = 0.25
 
 # 查询指令前缀
 TITLE_ABS_INSTRUCTION = "Retrieve the most relevant patents"
+DESC_INSTRUCTION = "Find patents with similar technical details and implementation"
 CLAIMS_INSTRUCTION = "Find patents with similar claim scope"
 
 
@@ -45,6 +47,7 @@ class SearchHit(BaseModel):
     applicant: str = ""
     title: str = ""
     abstract: str = ""
+    description: str = ""
     claims: str = ""
 
 
@@ -97,13 +100,14 @@ def _get_embedding(text: str, instruction: str | None = None) -> list[float]:
 
 @router.post("", response_model=SearchResponse)
 async def search(req: SearchRequest):
-    """语义搜索专利（双向量加权检索）"""
+    """语义搜索专利（三向量加权检索）"""
     # 检查数据库是否存在
     if not DB_PATH.exists():
         raise HTTPException(status_code=404, detail="请先导入数据")
 
-    # 生成两组查询向量（带不同指令前缀）
+    # 生成三组查询向量（带不同指令前缀）
     title_abs_query_vec = _get_embedding(req.query, instruction=TITLE_ABS_INSTRUCTION)
+    desc_query_vec = _get_embedding(req.query, instruction=DESC_INSTRUCTION)
     claims_query_vec = _get_embedding(req.query, instruction=CLAIMS_INSTRUCTION)
 
     # 打开集合
@@ -117,7 +121,7 @@ async def search(req: SearchRequest):
     if req.applicant:
         filter_expr = f"applicant == '{req.applicant}'"
 
-    # 分别对两个向量字段执行查询，取更多候选以便融合排序
+    # 分别对三个向量字段执行查询，取更多候选以便融合排序
     candidate_count = min(req.topk * 3, 100)
 
     try:
@@ -130,6 +134,15 @@ async def search(req: SearchRequest):
         raise HTTPException(status_code=500, detail=f"搜索标题摘要向量失败: {e}")
 
     try:
+        desc_results = collection.query(
+            queries=zvec.Query(field_name="desc_vec", vector=desc_query_vec),
+            topk=candidate_count,
+            filter=filter_expr,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"搜索说明书向量失败: {e}")
+
+    try:
         claims_results = collection.query(
             queries=zvec.Query(field_name="claims_vec", vector=claims_query_vec),
             topk=candidate_count,
@@ -138,16 +151,29 @@ async def search(req: SearchRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"搜索权利要求向量失败: {e}")
 
-    # 合并两组结果，使用加权分数
+    # 合并三组结果，使用加权分数
     score_map: dict[str, dict] = {}
 
     for doc in title_abs_results:
         score_map[doc.id] = {
             "id": doc.id,
             "title_abs_score": doc.score if doc.score is not None else 0.0,
+            "desc_score": 0.0,
             "claims_score": 0.0,
             "fields": doc.fields or {},
         }
+
+    for doc in desc_results:
+        if doc.id in score_map:
+            score_map[doc.id]["desc_score"] = doc.score if doc.score is not None else 0.0
+        else:
+            score_map[doc.id] = {
+                "id": doc.id,
+                "title_abs_score": 0.0,
+                "desc_score": doc.score if doc.score is not None else 0.0,
+                "claims_score": 0.0,
+                "fields": doc.fields or {},
+            }
 
     for doc in claims_results:
         if doc.id in score_map:
@@ -156,6 +182,7 @@ async def search(req: SearchRequest):
             score_map[doc.id] = {
                 "id": doc.id,
                 "title_abs_score": 0.0,
+                "desc_score": 0.0,
                 "claims_score": doc.score if doc.score is not None else 0.0,
                 "fields": doc.fields or {},
             }
@@ -163,7 +190,11 @@ async def search(req: SearchRequest):
     # 计算加权最终分数并排序
     merged = []
     for doc_id, info in score_map.items():
-        final_score = TITLE_ABS_WEIGHT * info["title_abs_score"] + CLAIMS_WEIGHT * info["claims_score"]
+        final_score = (
+            TITLE_ABS_WEIGHT * info["title_abs_score"]
+            + DESC_WEIGHT * info["desc_score"]
+            + CLAIMS_WEIGHT * info["claims_score"]
+        )
         fields = info["fields"]
         merged.append(SearchHit(
             id=doc_id,
@@ -172,6 +203,7 @@ async def search(req: SearchRequest):
             applicant=str(fields.get("applicant", "")),
             title=str(fields.get("title", "")),
             abstract=str(fields.get("abstract", "")),
+            description=str(fields.get("description", "")),
             claims=str(fields.get("claims", "")),
         ))
 

@@ -9,6 +9,7 @@ interface SearchHit {
   applicant: string
   title: string
   abstract: string
+  description: string
   claims: string
 }
 
@@ -316,6 +317,34 @@ function SearchPage() {
                   {isExpanded ? hit.abstract : truncate(hit.abstract, 100)}
                 </p>
 
+                {/* 展开内容：说明书 */}
+                {isExpanded && hit.description && (
+                  <div style={{ marginTop: 12 }}>
+                    <h4
+                      style={{
+                        margin: "0 0 6px",
+                        fontSize: 14,
+                        color: "#4fc3f7",
+                      }}
+                    >
+                      说明书
+                    </h4>
+                    <p
+                      style={{
+                        margin: 0,
+                        fontSize: 13,
+                        color: "#aaa",
+                        lineHeight: 1.6,
+                        whiteSpace: "pre-wrap",
+                        maxHeight: 300,
+                        overflowY: "auto",
+                      }}
+                    >
+                      {hit.description}
+                    </p>
+                  </div>
+                )}
+
                 {/* 展开内容：权利要求 */}
                 {isExpanded && hit.claims && (
                   <div style={{ marginTop: 12 }}>
@@ -335,6 +364,8 @@ function SearchPage() {
                         color: "#aaa",
                         lineHeight: 1.6,
                         whiteSpace: "pre-wrap",
+                        maxHeight: 300,
+                        overflowY: "auto",
                       }}
                     >
                       {hit.claims}
