@@ -18,10 +18,19 @@ interface SearchResponse {
   results: SearchHit[]
 }
 
+/** 向量字段配置 */
+interface VectorFieldConfig {
+  key: string
+  label: string
+  enabled: boolean
+  weight: number
+}
+
 /** 搜索状态响应 */
 interface StatusResponse {
   available: boolean
   document_count: number
+  vector_fields: VectorFieldConfig[]
 }
 
 /** 截断文本 */
@@ -32,9 +41,13 @@ function truncate(text: string, maxLen: number): string {
 
 /** 相似度分数转百分比 */
 function scoreToPercent(score: number): string {
-  // 将分数映射到 0~100% 范围
   const percent = Math.max(0, Math.min(100, score * 100))
   return percent.toFixed(1) + "%"
+}
+
+/** 权重转显示百分比 */
+function weightToPercent(weight: number): string {
+  return (weight * 100).toFixed(0) + "%"
 }
 
 /** 搜索页面 */
@@ -49,13 +62,59 @@ function SearchPage() {
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const [status, setStatus] = useState<StatusResponse | null>(null)
 
+  // 向量字段配置
+  const [vectorFields, setVectorFields] = useState<VectorFieldConfig[]>([
+    { key: "title_abs", label: "标题+摘要", enabled: true, weight: 0.45 },
+    { key: "desc", label: "说明书", enabled: true, weight: 0.15 },
+    { key: "claims", label: "权利要求", enabled: true, weight: 0.40 },
+  ])
+
+  // 高级设置面板开关
+  const [showAdvanced, setShowAdvanced] = useState(false)
+
   // 页面加载时检查搜索状态
   useEffect(() => {
     api
       .get<StatusResponse>("/search/status")
-      .then((res) => setStatus(res.data))
-      .catch(() => setStatus({ available: false, document_count: 0 }))
+      .then((res) => {
+        setStatus(res.data)
+        if (res.data.vector_fields && res.data.vector_fields.length > 0) {
+          setVectorFields(res.data.vector_fields)
+        }
+      })
+      .catch(() => setStatus({ available: false, document_count: 0, vector_fields: [] }))
   }, [])
+
+  /** 切换向量字段启用 */
+  const toggleField = (key: string) => {
+    setVectorFields((prev) => {
+      const newFields = prev.map((f) =>
+        f.key === key ? { ...f, enabled: !f.enabled } : f
+      )
+      // 至少需要一个启用
+      const enabledCount = newFields.filter((f) => f.enabled).length
+      if (enabledCount === 0) return prev
+      return newFields
+    })
+  }
+
+  /** 调整权重 */
+  const adjustWeight = (key: string, weight: number) => {
+    setVectorFields((prev) =>
+      prev.map((f) => (f.key === key ? { ...f, weight } : f))
+    )
+  }
+
+  /** 归一化已启用字段的权重 */
+  const getNormalizedWeights = (): Record<string, number> => {
+    const enabled = vectorFields.filter((f) => f.enabled)
+    const total = enabled.reduce((sum, f) => sum + f.weight, 0)
+    if (total <= 0) {
+      const equal = 1.0 / enabled.length
+      return Object.fromEntries(enabled.map((f) => [f.key, equal]))
+    }
+    return Object.fromEntries(enabled.map((f) => [f.key, f.weight / total]))
+  }
 
   /** 执行搜索 */
   const handleSearch = async (e: FormEvent) => {
@@ -67,6 +126,8 @@ function SearchPage() {
     setSearched(true)
     setExpandedId(null)
 
+    const normWeights = getNormalizedWeights()
+
     try {
       const params: Record<string, unknown> = {
         query: query.trim(),
@@ -75,17 +136,17 @@ function SearchPage() {
       if (applicant.trim()) {
         params.applicant = applicant.trim()
       }
+      // 向量字段开关
+      for (const f of vectorFields) {
+        params[`use_${f.key}`] = f.enabled
+        params[`weight_${f.key}`] = normWeights[f.key] ?? 0
+      }
       const res = await api.post<SearchResponse>("/search", params)
       setResults(res.data.results)
     } catch (err: unknown) {
-      if (import.meta.env.DEV) {
-        // 开发环境详细错误
-        if (err && typeof err === "object" && "response" in err) {
-          const axiosErr = err as { response?: { data?: { detail?: string } } }
-          setError(axiosErr.response?.data?.detail || "搜索失败，请重试")
-        } else {
-          setError("搜索失败，请重试")
-        }
+      if (err && typeof err === "object" && "response" in err) {
+        const axiosErr = err as { response?: { data?: { detail?: string } } }
+        setError(axiosErr.response?.data?.detail || "搜索失败，请重试")
       } else {
         setError("搜索失败，请重试")
       }
@@ -108,6 +169,9 @@ function SearchPage() {
       </div>
     )
   }
+
+  const enabledFields = vectorFields.filter((f) => f.enabled)
+  const normWeights = getNormalizedWeights()
 
   return (
     <div style={{ maxWidth: 960, margin: "0 auto" }}>
@@ -143,7 +207,7 @@ function SearchPage() {
             display: "flex",
             gap: 12,
             alignItems: "center",
-            marginBottom: 24,
+            marginBottom: 12,
           }}
         >
           {/* 申请人过滤 */}
@@ -162,7 +226,6 @@ function SearchPage() {
               fontSize: 14,
               boxSizing: "border-box",
               outline: "none",
-              transition: "border-color 0.2s",
             }}
             onFocus={(e) => (e.target.style.borderColor = "#4fc3f7")}
             onBlur={(e) => (e.target.style.borderColor = "#444")}
@@ -208,6 +271,112 @@ function SearchPage() {
           >
             {loading ? "搜索中..." : "搜索"}
           </button>
+        </div>
+
+        {/* 高级设置开关 */}
+        <div style={{ marginBottom: 16 }}>
+          <button
+            type="button"
+            onClick={() => setShowAdvanced(!showAdvanced)}
+            style={{
+              background: "none",
+              border: "none",
+              color: "#4fc3f7",
+              fontSize: 13,
+              cursor: "pointer",
+              padding: "4px 0",
+              display: "flex",
+              alignItems: "center",
+              gap: 4,
+            }}
+          >
+            <span style={{ transition: "transform 0.2s", display: "inline-block", transform: showAdvanced ? "rotate(90deg)" : "rotate(0deg)" }}>
+              ▸
+            </span>
+            检索字段与权重配置
+          </button>
+
+          {showAdvanced && (
+            <div
+              style={{
+                marginTop: 8,
+                padding: "16px 20px",
+                borderRadius: 8,
+                backgroundColor: "#22223a",
+                border: "1px solid #3a3a4e",
+              }}
+            >
+              <p style={{ margin: "0 0 12px", color: "#999", fontSize: 13 }}>
+                选择参与检索的向量字段并调整权重，权重越高该字段对排序影响越大
+              </p>
+
+              {vectorFields.map((field) => (
+                <div
+                  key={field.key}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 12,
+                    marginBottom: 10,
+                    opacity: field.enabled ? 1 : 0.4,
+                  }}
+                >
+                  {/* 开关 */}
+                  <label
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                      cursor: "pointer",
+                      minWidth: 120,
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={field.enabled}
+                      onChange={() => toggleField(field.key)}
+                      style={{ cursor: "pointer", width: 16, height: 16 }}
+                    />
+                    <span style={{ fontSize: 14, color: "#ddd" }}>{field.label}</span>
+                  </label>
+
+                  {/* 权重滑块 */}
+                  <input
+                    type="range"
+                    min={0}
+                    max={1}
+                    step={0.05}
+                    value={field.weight}
+                    onChange={(e) => adjustWeight(field.key, parseFloat(e.target.value))}
+                    disabled={!field.enabled}
+                    style={{
+                      flex: 1,
+                      cursor: field.enabled ? "pointer" : "not-allowed",
+                      accentColor: "#4fc3f7",
+                    }}
+                  />
+
+                  {/* 归一化权重百分比 */}
+                  <span
+                    style={{
+                      fontSize: 13,
+                      color: field.enabled ? "#4fc3f7" : "#666",
+                      minWidth: 40,
+                      textAlign: "right",
+                    }}
+                  >
+                    {field.enabled ? weightToPercent(normWeights[field.key] ?? 0) : "—"}
+                  </span>
+                </div>
+              ))}
+
+              <div style={{ marginTop: 4, fontSize: 12, color: "#777" }}>
+                当前搜索按：
+                {enabledFields.map((f) => `${f.label} ${weightToPercent(normWeights[f.key] ?? 0)}`).join(" + ")}
+                {" "}加权
+              </div>
+            </div>
+          )}
         </div>
       </form>
 
@@ -299,9 +468,7 @@ function SearchPage() {
                   }}
                 >
                   {hit.patent_no && <span>{hit.patent_no}</span>}
-                  {hit.patent_no && hit.applicant && (
-                    <span> · </span>
-                  )}
+                  {hit.patent_no && hit.applicant && <span> · </span>}
                   {hit.applicant && <span>{hit.applicant}</span>}
                 </div>
 
@@ -320,13 +487,7 @@ function SearchPage() {
                 {/* 展开内容：说明书 */}
                 {isExpanded && hit.description && (
                   <div style={{ marginTop: 12 }}>
-                    <h4
-                      style={{
-                        margin: "0 0 6px",
-                        fontSize: 14,
-                        color: "#4fc3f7",
-                      }}
-                    >
+                    <h4 style={{ margin: "0 0 6px", fontSize: 14, color: "#4fc3f7" }}>
                       说明书
                     </h4>
                     <p
@@ -348,13 +509,7 @@ function SearchPage() {
                 {/* 展开内容：权利要求 */}
                 {isExpanded && hit.claims && (
                   <div style={{ marginTop: 12 }}>
-                    <h4
-                      style={{
-                        margin: "0 0 6px",
-                        fontSize: 14,
-                        color: "#4fc3f7",
-                      }}
-                    >
+                    <h4 style={{ margin: "0 0 6px", fontSize: 14, color: "#4fc3f7" }}>
                       权利要求
                     </h4>
                     <p
