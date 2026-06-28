@@ -1,8 +1,8 @@
 fastapi
 uvicorn[standard]
 zvec
-dashtext
 pandas
 openpyxl
 openai
 python-multipart
+# dashtext  # BM25 稀疏向量依赖，Python 3.14 暂不支持，已做延迟初始化
