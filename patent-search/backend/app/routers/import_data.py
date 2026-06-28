@@ -20,9 +20,6 @@ CONFIG_FILE = Path(__file__).resolve().parent.parent.parent / "data" / "config.j
 EMBEDDING_BATCH_SIZE = 50
 INSERT_BATCH_SIZE = 100
 
-# 向量维度（Qwen3-Embedding-0.6B 固定使用 512 维）
-VECTOR_DIMENSION = 512
-
 # BM25 稀疏向量生成器（延迟初始化，避免 dashtext 不兼容时整个模块无法导入）
 _bm25_doc_fn = None
 
@@ -213,7 +210,7 @@ def _generate_embeddings(
     api_key: str,
     model_name: str,
     base_url: str,
-    dimensions: int = VECTOR_DIMENSION,
+    dimensions: int = 512,
 ) -> list[list[float]]:
     """调用 OpenAI 兼容接口生成向量，支持指定维度"""
     client = OpenAI(api_key=api_key, base_url=base_url)
@@ -268,8 +265,9 @@ def import_data(req: ImportRequest):
     # 2. 读取配置
     config = _read_config()
     api_key = config.get("api_key", "")
-    model_name = config.get("model_name", "Qwen/Qwen3-Embedding-0.6B")
-    base_url = config.get("base_url", "https://api.siliconflow.cn/v1")
+    model_name = config.get("model_name", "embedding-3")
+    base_url = config.get("base_url", "https://open.bigmodel.cn/api/paas/v4")
+    dimension = config.get("dimension", 512)
 
     if not api_key:
         raise HTTPException(status_code=400, detail="API 密钥为空，请先在设置页面配置")
@@ -281,22 +279,22 @@ def import_data(req: ImportRequest):
 
     try:
         first_title_abs_emb = _generate_embeddings(
-            [first_title_abs], api_key, model_name, base_url, dimensions=VECTOR_DIMENSION,
+            [first_title_abs], api_key, model_name, base_url, dimensions=dimension,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"调用嵌入接口失败: {e}")
 
-    # 4. 获取或创建集合（固定 512 维）
-    collection = get_or_create_collection(VECTOR_DIMENSION)
+    # 4. 获取或创建集合
+    collection = get_or_create_collection(dimension)
 
     # 5. 生成第一条数据的 desc 和 claims 向量并插入
-    zero_vec = [0.0] * VECTOR_DIMENSION
+    zero_vec = [0.0] * dimension
 
     first_desc = build_desc_text(rows[0], req.mapping)
     if first_desc.strip():
         try:
             first_desc_emb = _generate_embeddings(
-                [first_desc], api_key, model_name, base_url, dimensions=VECTOR_DIMENSION,
+                [first_desc], api_key, model_name, base_url, dimensions=dimension,
             )
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"调用嵌入接口失败: {e}")
@@ -307,7 +305,7 @@ def import_data(req: ImportRequest):
     if first_claims.strip():
         try:
             first_claims_emb = _generate_embeddings(
-                [first_claims], api_key, model_name, base_url, dimensions=VECTOR_DIMENSION,
+                [first_claims], api_key, model_name, base_url, dimensions=dimension,
             )
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"调用嵌入接口失败: {e}")
@@ -348,7 +346,7 @@ def import_data(req: ImportRequest):
         non_empty = [t for t in texts if t]
         if not non_empty:
             return [zero_vec] * len(texts)
-        raw = _generate_embeddings(non_empty, api_key, model_name, base_url, dimensions=VECTOR_DIMENSION)
+        raw = _generate_embeddings(non_empty, api_key, model_name, base_url, dimensions=dimension)
         result = []
         raw_idx = 0
         for t in texts:
@@ -380,7 +378,7 @@ def import_data(req: ImportRequest):
         if len(batch_title_abs) >= EMBEDDING_BATCH_SIZE:
             try:
                 title_abs_embeddings = _generate_embeddings(
-                    batch_title_abs, api_key, model_name, base_url, dimensions=VECTOR_DIMENSION,
+                    batch_title_abs, api_key, model_name, base_url, dimensions=dimension,
                 )
                 desc_embeddings = _embed_with_zero_fallback(
                     batch_desc, api_key, model_name, base_url,
@@ -434,7 +432,7 @@ def import_data(req: ImportRequest):
     if batch_title_abs:
         try:
             title_abs_embeddings = _generate_embeddings(
-                batch_title_abs, api_key, model_name, base_url, dimensions=VECTOR_DIMENSION,
+                batch_title_abs, api_key, model_name, base_url, dimensions=dimension,
             )
             desc_embeddings = _embed_with_zero_fallback(
                 batch_desc, api_key, model_name, base_url,

@@ -6,6 +6,7 @@ interface ConfigForm {
   api_key: string
   model_name: string
   base_url: string
+  dimension: number
 }
 
 /** GET /api/config 响应 */
@@ -13,6 +14,7 @@ interface ConfigResponse {
   api_key: string
   model_name: string
   base_url: string
+  dimension: number
 }
 
 /** POST /api/config/validate 响应 */
@@ -26,8 +28,9 @@ interface ValidateResponse {
 function SettingsPage() {
   const [form, setForm] = useState<ConfigForm>({
     api_key: "",
-    model_name: "Qwen/Qwen3-Embedding-0.6B",
-    base_url: "https://api.siliconflow.cn/v1",
+    model_name: "embedding-3",
+    base_url: "https://open.bigmodel.cn/api/paas/v4",
+    dimension: 512,
   })
   const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null)
   const [validating, setValidating] = useState(false)
@@ -40,8 +43,9 @@ function SettingsPage() {
       .then((res) => {
         setForm({
           api_key: res.data.api_key || "",
-          model_name: res.data.model_name || "Qwen/Qwen3-Embedding-0.6B",
-          base_url: res.data.base_url || "https://api.siliconflow.cn/v1",
+          model_name: res.data.model_name || "embedding-3",
+          base_url: res.data.base_url || "https://open.bigmodel.cn/api/paas/v4",
+          dimension: res.data.dimension || 512,
         })
       })
       .catch(() => {
@@ -148,7 +152,7 @@ function SettingsPage() {
             type="text"
             value={form.base_url}
             onChange={(e) => setForm({ ...form, base_url: e.target.value })}
-            placeholder="https://api.siliconflow.cn/v1"
+            placeholder="https://open.bigmodel.cn/api/paas/v4"
             style={{
               width: "100%",
               padding: "8px 12px",
@@ -160,6 +164,36 @@ function SettingsPage() {
               boxSizing: "border-box",
             }}
           />
+        </div>
+
+        {/* 向量维度 */}
+        <div style={{ marginBottom: 16 }}>
+          <label style={{ display: "block", marginBottom: 6, fontWeight: "bold" }}>
+            向量维度
+          </label>
+          <select
+            value={form.dimension}
+            onChange={(e) => setForm({ ...form, dimension: Number(e.target.value) })}
+            style={{
+              width: "100%",
+              padding: "8px 12px",
+              borderRadius: 6,
+              border: "1px solid #444",
+              backgroundColor: "#1a1a2e",
+              color: "#eee",
+              fontSize: 14,
+              boxSizing: "border-box",
+              cursor: "pointer",
+            }}
+          >
+            <option value={256}>256 维（高效）</option>
+            <option value={512}>512 维（均衡，推荐）</option>
+            <option value={1024}>1024 维（高精度）</option>
+            <option value={2048}>2048 维（最高精度）</option>
+          </select>
+          <p style={{ margin: "4px 0 0", fontSize: 12, color: "#888" }}>
+            维度越高精度越好，但存储和计算成本也越高。切换维度需删除已有数据重新导入。
+          </p>
         </div>
 
         {/* 按钮组 */}

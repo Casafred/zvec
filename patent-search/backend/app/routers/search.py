@@ -16,11 +16,9 @@ CONFIG_FILE = DATA_DIR / "config.json"
 DB_PATH = DATA_DIR / "patent_db"
 
 # 默认配置值
-DEFAULT_MODEL_NAME = "Qwen/Qwen3-Embedding-0.6B"
-DEFAULT_BASE_URL = "https://api.siliconflow.cn/v1"
-
-# 向量维度（与导入保持一致）
-VECTOR_DIMENSION = 512
+DEFAULT_MODEL_NAME = "embedding-3"
+DEFAULT_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
+DEFAULT_DIMENSION = 512
 
 # 默认加权系数（标题摘要和权利要求最重，BM25关键词次之，说明书辅助）
 DEFAULT_TITLE_ABS_WEIGHT = 0.40
@@ -133,11 +131,13 @@ def _get_embedding(text: str, instruction: str | None = None) -> list[float]:
     else:
         input_text = text
 
+    dimension = config.get("dimension", DEFAULT_DIMENSION)
+
     client = OpenAI(api_key=api_key, base_url=base_url)
     response = client.embeddings.create(
         model=model_name,
         input=input_text,
-        dimensions=VECTOR_DIMENSION,
+        dimensions=dimension,
     )
     return response.data[0].embedding
 

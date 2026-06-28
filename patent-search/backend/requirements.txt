@@ -5,4 +5,4 @@ pandas
 openpyxl
 openai
 python-multipart
-# dashtext  # BM25 稀疏向量依赖，Python 3.14 暂不支持，已做延迟初始化
+dashtext  # BM25 稀疏向量依赖（需 Python 3.10-3.12，3.14 暂不支持）
