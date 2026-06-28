@@ -177,20 +177,25 @@ async def search(req: SearchRequest):
     queries: list[Query] = []
     weights: list[float] = []
 
-    if req.use_title_abs:
-        title_abs_vec = _get_embedding(req.query, instruction=TITLE_ABS_INSTRUCTION)
-        queries.append(Query(field_name="title_abs_vec", vector=title_abs_vec))
-        weights.append(req.weight_title_abs)
+    try:
+        if req.use_title_abs:
+            title_abs_vec = _get_embedding(req.query, instruction=TITLE_ABS_INSTRUCTION)
+            queries.append(Query(field_name="title_abs_vec", vector=title_abs_vec))
+            weights.append(req.weight_title_abs)
 
-    if req.use_desc:
-        desc_vec = _get_embedding(req.query, instruction=DESC_INSTRUCTION)
-        queries.append(Query(field_name="desc_vec", vector=desc_vec))
-        weights.append(req.weight_desc)
+        if req.use_desc:
+            desc_vec = _get_embedding(req.query, instruction=DESC_INSTRUCTION)
+            queries.append(Query(field_name="desc_vec", vector=desc_vec))
+            weights.append(req.weight_desc)
 
-    if req.use_claims:
-        claims_vec = _get_embedding(req.query, instruction=CLAIMS_INSTRUCTION)
-        queries.append(Query(field_name="claims_vec", vector=claims_vec))
-        weights.append(req.weight_claims)
+        if req.use_claims:
+            claims_vec = _get_embedding(req.query, instruction=CLAIMS_INSTRUCTION)
+            queries.append(Query(field_name="claims_vec", vector=claims_vec))
+            weights.append(req.weight_claims)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"调用嵌入接口失败: {e}")
 
     if req.use_bm25:
         bm25_fn = _get_bm25_query_fn()
@@ -214,7 +219,7 @@ async def search(req: SearchRequest):
     # 构建过滤条件
     filter_expr = None
     if req.applicant:
-        filter_expr = f"applicant == '{req.applicant}'"
+        filter_expr = f"applicant = '{req.applicant}'"
 
     # 使用 multi_query + WeightedReRanker 执行混合检索
     try:

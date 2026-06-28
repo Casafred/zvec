@@ -1,0 +1,5 @@
+{
+  "api_key": "sk-test-fake-key-1234567890",
+  "model_name": "Qwen/Qwen3-Embedding-0.6B",
+  "base_url": "https://api.siliconflow.cn/v1"
+}

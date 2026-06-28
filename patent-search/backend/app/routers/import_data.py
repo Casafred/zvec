@@ -453,7 +453,7 @@ def import_data(req: ImportRequest):
         docs = []
         for idx_in_batch, row_idx in enumerate(batch_indices):
             row = remaining_rows[row_idx - 1]
-            bm25_vec = _get_bm25_doc_fn().embed(batch_bm25[idx_in_batch])
+            bm25_vec = bm25_fn.embed(batch_bm25[idx_in_batch]) if bm25_fn else {}
             docs.append(_build_doc(
                 row, req.mapping, row_idx,
                 title_abs_embeddings[idx_in_batch],

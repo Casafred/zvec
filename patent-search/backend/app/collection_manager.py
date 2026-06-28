@@ -51,8 +51,9 @@ def _build_schema(dimension: int = 512) -> zvec.CollectionSchema:
             zvec.VectorSchema(
                 "bm25_vec",
                 zvec.DataType.SPARSE_VECTOR_FP32,
-                metric_type=zvec.MetricType.IP,
-                index_type=zvec.IndexType.FLAT,
+                index_param=zvec.FlatIndexParam(
+                    metric_type=zvec.MetricType.IP,
+                ),
             ),
         ],
     )
