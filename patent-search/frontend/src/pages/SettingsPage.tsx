@@ -1,11 +1,41 @@
 import { useState, useEffect, type FormEvent } from "react"
 import api from "../api"
 
+/** 模型预设 */
+interface ModelPreset {
+  label: string
+  model_name: string
+  base_url: string
+  dimension: number
+}
+
+const MODEL_PRESETS: ModelPreset[] = [
+  {
+    label: "智谱 Embedding-3",
+    model_name: "embedding-3",
+    base_url: "https://open.bigmodel.cn/api/paas/v4",
+    dimension: 512,
+  },
+  {
+    label: "硅基流动 Qwen3-Embedding-0.6B",
+    model_name: "Qwen/Qwen3-Embedding-0.6B",
+    base_url: "https://api.siliconflow.cn/v1",
+    dimension: 512,
+  },
+  {
+    label: "自定义",
+    model_name: "",
+    base_url: "",
+    dimension: 512,
+  },
+]
+
 /** 配置表单数据 */
 interface ConfigForm {
   api_key: string
   model_name: string
   base_url: string
+  dimension: number
 }
 
 /** GET /api/config 响应 */
@@ -13,6 +43,7 @@ interface ConfigResponse {
   api_key: string
   model_name: string
   base_url: string
+  dimension: number
 }
 
 /** POST /api/config/validate 响应 */
@@ -22,13 +53,44 @@ interface ValidateResponse {
   dimension?: number
 }
 
+/** 根据 model_name 匹配预设索引 */
+function matchPreset(form: ConfigForm): number {
+  for (let i = 0; i < MODEL_PRESETS.length - 1; i++) {
+    if (
+      MODEL_PRESETS[i].model_name === form.model_name &&
+      MODEL_PRESETS[i].base_url === form.base_url
+    ) {
+      return i
+    }
+  }
+  return MODEL_PRESETS.length - 1 // 自定义
+}
+
+const inputStyle: React.CSSProperties = {
+  width: "100%",
+  padding: "8px 12px",
+  borderRadius: 6,
+  border: "1px solid #444",
+  backgroundColor: "#1a1a2e",
+  color: "#eee",
+  fontSize: 14,
+  boxSizing: "border-box",
+}
+
+const selectStyle: React.CSSProperties = {
+  ...inputStyle,
+  cursor: "pointer",
+}
+
 /** 设置页面 */
 function SettingsPage() {
   const [form, setForm] = useState<ConfigForm>({
     api_key: "",
-    model_name: "Qwen/Qwen3-Embedding-0.6B",
-    base_url: "https://api.siliconflow.cn/v1",
+    model_name: "embedding-3",
+    base_url: "https://open.bigmodel.cn/api/paas/v4",
+    dimension: 512,
   })
+  const [presetIdx, setPresetIdx] = useState(0)
   const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null)
   const [validating, setValidating] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -38,16 +100,31 @@ function SettingsPage() {
     api
       .get<ConfigResponse>("/config")
       .then((res) => {
-        setForm({
+        const f: ConfigForm = {
           api_key: res.data.api_key || "",
-          model_name: res.data.model_name || "Qwen/Qwen3-Embedding-0.6B",
-          base_url: res.data.base_url || "https://api.siliconflow.cn/v1",
-        })
+          model_name: res.data.model_name || "embedding-3",
+          base_url: res.data.base_url || "https://open.bigmodel.cn/api/paas/v4",
+          dimension: res.data.dimension || 512,
+        }
+        setForm(f)
+        setPresetIdx(matchPreset(f))
       })
       .catch(() => {
         setMessage({ type: "error", text: "加载配置失败" })
       })
   }, [])
+
+  /** 切换预设 */
+  const handlePresetChange = (idx: number) => {
+    setPresetIdx(idx)
+    const p = MODEL_PRESETS[idx]
+    setForm({
+      ...form,
+      model_name: p.model_name || form.model_name,
+      base_url: p.base_url || form.base_url,
+      dimension: p.dimension,
+    })
+  }
 
   /** 保存配置 */
   const handleSave = async (e: FormEvent) => {
@@ -88,11 +165,31 @@ function SettingsPage() {
     }
   }
 
+  const isCustom = presetIdx === MODEL_PRESETS.length - 1
+
   return (
     <div style={{ maxWidth: 600 }}>
       <h2 style={{ marginBottom: 24 }}>系统设置</h2>
 
       <form onSubmit={handleSave}>
+        {/* 模型预设 */}
+        <div style={{ marginBottom: 16 }}>
+          <label style={{ display: "block", marginBottom: 6, fontWeight: "bold" }}>
+            模型预设
+          </label>
+          <select
+            value={presetIdx}
+            onChange={(e) => handlePresetChange(Number(e.target.value))}
+            style={selectStyle}
+          >
+            {MODEL_PRESETS.map((p, i) => (
+              <option key={i} value={i}>
+                {p.label}
+              </option>
+            ))}
+          </select>
+        </div>
+
         {/* API 密钥 */}
         <div style={{ marginBottom: 16 }}>
           <label style={{ display: "block", marginBottom: 6, fontWeight: "bold" }}>
@@ -103,16 +200,7 @@ function SettingsPage() {
             value={form.api_key}
             onChange={(e) => setForm({ ...form, api_key: e.target.value })}
             placeholder="请输入 API 密钥"
-            style={{
-              width: "100%",
-              padding: "8px 12px",
-              borderRadius: 6,
-              border: "1px solid #444",
-              backgroundColor: "#1a1a2e",
-              color: "#eee",
-              fontSize: 14,
-              boxSizing: "border-box",
-            }}
+            style={inputStyle}
           />
         </div>
 
@@ -124,18 +212,13 @@ function SettingsPage() {
           <input
             type="text"
             value={form.model_name}
-            onChange={(e) => setForm({ ...form, model_name: e.target.value })}
-            placeholder="Qwen/Qwen3-Embedding-0.6B"
-            style={{
-              width: "100%",
-              padding: "8px 12px",
-              borderRadius: 6,
-              border: "1px solid #444",
-              backgroundColor: "#1a1a2e",
-              color: "#eee",
-              fontSize: 14,
-              boxSizing: "border-box",
+            onChange={(e) => {
+              setForm({ ...form, model_name: e.target.value })
+              setPresetIdx(matchPreset({ ...form, model_name: e.target.value }))
             }}
+            placeholder="embedding-3"
+            disabled={!isCustom}
+            style={{ ...inputStyle, opacity: isCustom ? 1 : 0.6 }}
           />
         </div>
 
@@ -147,19 +230,34 @@ function SettingsPage() {
           <input
             type="text"
             value={form.base_url}
-            onChange={(e) => setForm({ ...form, base_url: e.target.value })}
-            placeholder="https://api.siliconflow.cn/v1"
-            style={{
-              width: "100%",
-              padding: "8px 12px",
-              borderRadius: 6,
-              border: "1px solid #444",
-              backgroundColor: "#1a1a2e",
-              color: "#eee",
-              fontSize: 14,
-              boxSizing: "border-box",
+            onChange={(e) => {
+              setForm({ ...form, base_url: e.target.value })
+              setPresetIdx(matchPreset({ ...form, base_url: e.target.value }))
             }}
+            placeholder="https://open.bigmodel.cn/api/paas/v4"
+            disabled={!isCustom}
+            style={{ ...inputStyle, opacity: isCustom ? 1 : 0.6 }}
           />
+        </div>
+
+        {/* 向量维度 */}
+        <div style={{ marginBottom: 16 }}>
+          <label style={{ display: "block", marginBottom: 6, fontWeight: "bold" }}>
+            向量维度
+          </label>
+          <select
+            value={form.dimension}
+            onChange={(e) => setForm({ ...form, dimension: Number(e.target.value) })}
+            style={selectStyle}
+          >
+            <option value={256}>256 维（高效）</option>
+            <option value={512}>512 维（均衡，推荐）</option>
+            <option value={1024}>1024 维（高精度）</option>
+            <option value={2048}>2048 维（最高精度）</option>
+          </select>
+          <p style={{ margin: "4px 0 0", fontSize: 12, color: "#888" }}>
+            维度越高精度越好，但存储和计算成本也越高。切换维度需删除已有数据重新导入。
+          </p>
         </div>
 
         {/* 按钮组 */}
@@ -195,7 +293,7 @@ function SettingsPage() {
               opacity: validating ? 0.6 : 1,
             }}
           >
-            {validating ? "验证中..." : "验证"}
+            {validating ? "验证中..." : "验证连接"}
           </button>
         </div>
       </form>

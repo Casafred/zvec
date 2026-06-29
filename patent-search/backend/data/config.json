@@ -1,0 +1,6 @@
+{
+  "api_key": "5eea4114c7060f610bedfb50999b21df.fvWpnKnNDxz0M3Vh",
+  "model_name": "embedding-3",
+  "base_url": "https://open.bigmodel.cn/api/paas/v4",
+  "dimension": 512
+}

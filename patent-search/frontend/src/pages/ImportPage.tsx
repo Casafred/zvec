@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, type DragEvent, type ChangeEvent } from 'react'
 import { Link } from 'react-router-dom'
 import axios from 'axios'
+import api from '../api'
 
 /** 专利字段定义 */
 const PATENT_FIELDS = [
@@ -64,8 +65,8 @@ function ImportPage() {
 
   /** 获取集合状态 */
   useEffect(() => {
-    axios
-      .get<CollectionStatus>('/api/import/status')
+    api
+      .get<CollectionStatus>('/import/status')
       .then((res) => setCollectionStatus(res.data))
       .catch(() => {
         // 忽略错误，集合可能不存在
@@ -90,7 +91,7 @@ function ImportPage() {
     formData.append('file', file)
 
     try {
-      const response = await axios.post<UploadResult>('/api/upload', formData, {
+      const response = await api.post<UploadResult>('/upload', formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
       })
       setUploadResult(response.data)
@@ -152,7 +153,7 @@ function ImportPage() {
     setImportResult(null)
 
     try {
-      const response = await axios.post<ImportResult>('/api/import', {
+      const response = await api.post<ImportResult>('/import', {
         upload_id: uploadResult.upload_id,
         mapping,
       })
