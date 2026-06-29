@@ -8,12 +8,13 @@ from pydantic import BaseModel, Field
 import zvec
 from zvec import Query
 
+from app.collection_manager import get_collection, COLLECTION_PATH
+
 router = APIRouter(prefix="/api/search", tags=["搜索"])
 
 # 路径常量
 DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 CONFIG_FILE = DATA_DIR / "config.json"
-DB_PATH = DATA_DIR / "patent_db"
 
 # 默认配置值
 DEFAULT_MODEL_NAME = "embedding-3"
@@ -170,7 +171,8 @@ def _get_bm25_query_fn():
 @router.post("", response_model=SearchResponse)
 async def search(req: SearchRequest):
     """混合检索专利（密集向量 + BM25稀疏向量，使用 multi_query + WeightedReRanker）"""
-    if not DB_PATH.exists():
+    collection = get_collection()
+    if collection is None:
         raise HTTPException(status_code=404, detail="请先导入数据")
 
     # 构建 queries 列表和对应权重
@@ -204,12 +206,6 @@ async def search(req: SearchRequest):
 
     # 归一化权重
     norm_weights = _normalize_weights(weights)
-
-    # 打开集合
-    try:
-        collection = zvec.open(str(DB_PATH))
-    except Exception:
-        raise HTTPException(status_code=404, detail="请先导入数据")
 
     # 构建过滤条件
     filter_expr = None
@@ -249,7 +245,8 @@ async def search(req: SearchRequest):
 @router.get("/status", response_model=StatusResponse)
 async def search_status():
     """检查搜索功能是否可用，返回向量字段默认配置"""
-    if not DB_PATH.exists():
+    collection = get_collection()
+    if collection is None:
         return StatusResponse(
             available=False,
             document_count=0,
@@ -262,7 +259,6 @@ async def search_status():
         )
 
     try:
-        collection = zvec.open(str(DB_PATH))
         stats = collection.stats
         doc_count = stats.doc_count
         return StatusResponse(
