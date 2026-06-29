@@ -1,4 +1,5 @@
 """文件上传路由"""
+import io
 import json
 import uuid
 from pathlib import Path
@@ -57,7 +58,7 @@ async def upload_file(file: UploadFile = File(...)):
 
     # 用 pandas 解析 Excel
     try:
-        df = pd.read_excel(contents, engine="openpyxl")
+        df = pd.read_excel(io.BytesIO(contents), engine="openpyxl")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Excel 文件解析失败: {e}")
 
