@@ -8,19 +8,18 @@ from pydantic import BaseModel, Field
 import zvec
 from zvec import Query
 
+from app.collection_manager import get_collection, COLLECTION_PATH
+
 router = APIRouter(prefix="/api/search", tags=["搜索"])
 
 # 路径常量
 DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 CONFIG_FILE = DATA_DIR / "config.json"
-DB_PATH = DATA_DIR / "patent_db"
 
 # 默认配置值
-DEFAULT_MODEL_NAME = "Qwen/Qwen3-Embedding-0.6B"
-DEFAULT_BASE_URL = "https://api.siliconflow.cn/v1"
-
-# 向量维度（与导入保持一致）
-VECTOR_DIMENSION = 512
+DEFAULT_MODEL_NAME = "embedding-3"
+DEFAULT_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
+DEFAULT_DIMENSION = 512
 
 # 默认加权系数（标题摘要和权利要求最重，BM25关键词次之，说明书辅助）
 DEFAULT_TITLE_ABS_WEIGHT = 0.40
@@ -133,11 +132,13 @@ def _get_embedding(text: str, instruction: str | None = None) -> list[float]:
     else:
         input_text = text
 
+    dimension = config.get("dimension", DEFAULT_DIMENSION)
+
     client = OpenAI(api_key=api_key, base_url=base_url)
     response = client.embeddings.create(
         model=model_name,
         input=input_text,
-        dimensions=VECTOR_DIMENSION,
+        dimensions=dimension,
     )
     return response.data[0].embedding
 
@@ -170,32 +171,28 @@ def _get_bm25_query_fn():
 @router.post("", response_model=SearchResponse)
 async def search(req: SearchRequest):
     """混合检索专利（密集向量 + BM25稀疏向量，使用 multi_query + WeightedReRanker）"""
-    if not DB_PATH.exists():
+    collection = get_collection()
+    if collection is None:
         raise HTTPException(status_code=404, detail="请先导入数据")
 
     # 构建 queries 列表和对应权重
     queries: list[Query] = []
     weights: list[float] = []
 
-    try:
-        if req.use_title_abs:
-            title_abs_vec = _get_embedding(req.query, instruction=TITLE_ABS_INSTRUCTION)
-            queries.append(Query(field_name="title_abs_vec", vector=title_abs_vec))
-            weights.append(req.weight_title_abs)
+    if req.use_title_abs:
+        title_abs_vec = _get_embedding(req.query, instruction=TITLE_ABS_INSTRUCTION)
+        queries.append(Query(field_name="title_abs_vec", vector=title_abs_vec))
+        weights.append(req.weight_title_abs)
 
-        if req.use_desc:
-            desc_vec = _get_embedding(req.query, instruction=DESC_INSTRUCTION)
-            queries.append(Query(field_name="desc_vec", vector=desc_vec))
-            weights.append(req.weight_desc)
+    if req.use_desc:
+        desc_vec = _get_embedding(req.query, instruction=DESC_INSTRUCTION)
+        queries.append(Query(field_name="desc_vec", vector=desc_vec))
+        weights.append(req.weight_desc)
 
-        if req.use_claims:
-            claims_vec = _get_embedding(req.query, instruction=CLAIMS_INSTRUCTION)
-            queries.append(Query(field_name="claims_vec", vector=claims_vec))
-            weights.append(req.weight_claims)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"调用嵌入接口失败: {e}")
+    if req.use_claims:
+        claims_vec = _get_embedding(req.query, instruction=CLAIMS_INSTRUCTION)
+        queries.append(Query(field_name="claims_vec", vector=claims_vec))
+        weights.append(req.weight_claims)
 
     if req.use_bm25:
         bm25_fn = _get_bm25_query_fn()
@@ -209,12 +206,6 @@ async def search(req: SearchRequest):
 
     # 归一化权重
     norm_weights = _normalize_weights(weights)
-
-    # 打开集合
-    try:
-        collection = zvec.open(str(DB_PATH))
-    except Exception:
-        raise HTTPException(status_code=404, detail="请先导入数据")
 
     # 构建过滤条件
     filter_expr = None
@@ -254,7 +245,8 @@ async def search(req: SearchRequest):
 @router.get("/status", response_model=StatusResponse)
 async def search_status():
     """检查搜索功能是否可用，返回向量字段默认配置"""
-    if not DB_PATH.exists():
+    collection = get_collection()
+    if collection is None:
         return StatusResponse(
             available=False,
             document_count=0,
@@ -267,7 +259,6 @@ async def search_status():
         )
 
     try:
-        collection = zvec.open(str(DB_PATH))
         stats = collection.stats
         doc_count = stats.doc_count
         return StatusResponse(

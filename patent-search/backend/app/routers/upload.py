@@ -1,4 +1,5 @@
-"""文件上传路由"""
+"""文件上传路由（支持 multipart 和 base64 JSON 两种方式）"""
+import base64
 import io
 import json
 import uuid
@@ -6,6 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 from fastapi import APIRouter, UploadFile, File, HTTPException
+from pydantic import BaseModel, Field
 
 router = APIRouter(prefix="/api/upload", tags=["上传"])
 
@@ -42,20 +44,8 @@ def auto_detect_mapping(columns: list[str]) -> dict[str, str | None]:
     return mapping
 
 
-@router.post("")
-async def upload_file(file: UploadFile = File(...)):
-    """上传 Excel 文件并解析"""
-    # 校验文件类型
-    filename = file.filename or ""
-    if not (filename.endswith(".xlsx") or filename.endswith(".xls")):
-        raise HTTPException(
-            status_code=400,
-            detail="仅支持 .xlsx 和 .xls 格式的文件",
-        )
-
-    # 读取文件内容
-    contents = await file.read()
-
+def _parse_excel_and_save(contents: bytes, filename: str) -> dict:
+    """解析 Excel 并保存为临时 JSON，返回上传结果"""
     # 用 pandas 解析 Excel
     try:
         df = pd.read_excel(io.BytesIO(contents), engine="openpyxl")
@@ -79,7 +69,6 @@ async def upload_file(file: UploadFile = File(...)):
     upload_id = str(uuid.uuid4())
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     json_path = UPLOAD_DIR / f"{upload_id}.json"
-    df.fillna("").to_dict(orient="records")
     data = df.fillna("").to_dict(orient="records")
     json_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
@@ -90,3 +79,35 @@ async def upload_file(file: UploadFile = File(...)):
         "mapping": mapping,
         "total_rows": total_rows,
     }
+
+
+@router.post("")
+async def upload_file(file: UploadFile = File(...)):
+    """上传 Excel 文件并解析（multipart/form-data 方式）"""
+    filename = file.filename or ""
+    if not (filename.endswith(".xlsx") or filename.endswith(".xls")):
+        raise HTTPException(status_code=400, detail="仅支持 .xlsx 和 .xls 格式的文件")
+
+    contents = await file.read()
+    return _parse_excel_and_save(contents, filename)
+
+
+class Base64UploadRequest(BaseModel):
+    """Base64 编码上传请求"""
+    filename: str = Field(..., description="文件名")
+    data: str = Field(..., description="Base64 编码的文件内容")
+
+
+@router.post("/base64")
+async def upload_base64(req: Base64UploadRequest):
+    """上传 Excel 文件并解析（Base64 JSON 方式，兼容代理环境）"""
+    filename = req.filename
+    if not (filename.endswith(".xlsx") or filename.endswith(".xls")):
+        raise HTTPException(status_code=400, detail="仅支持 .xlsx 和 .xls 格式的文件")
+
+    try:
+        contents = base64.b64decode(req.data)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Base64 解码失败: {e}")
+
+    return _parse_excel_and_save(contents, filename)

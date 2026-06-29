@@ -13,8 +13,9 @@ CONFIG_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
 # 默认配置值
-DEFAULT_MODEL_NAME = "Qwen/Qwen3-Embedding-0.6B"
-DEFAULT_BASE_URL = "https://api.siliconflow.cn/v1"
+DEFAULT_MODEL_NAME = "embedding-3"
+DEFAULT_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
+DEFAULT_DIMENSION = 512
 
 
 class ConfigRequest(BaseModel):
@@ -22,6 +23,7 @@ class ConfigRequest(BaseModel):
     api_key: str = Field(..., description="API 密钥")
     model_name: str = Field(default=DEFAULT_MODEL_NAME, description="模型名称")
     base_url: str = Field(default=DEFAULT_BASE_URL, description="API 地址")
+    dimension: int = Field(default=DEFAULT_DIMENSION, description="向量维度")
 
 
 class ConfigResponse(BaseModel):
@@ -29,6 +31,7 @@ class ConfigResponse(BaseModel):
     api_key: str = Field(..., description="脱敏后的 API 密钥")
     model_name: str = Field(..., description="模型名称")
     base_url: str = Field(..., description="API 地址")
+    dimension: int = Field(..., description="向量维度")
 
 
 class ValidateResponse(BaseModel):
@@ -69,6 +72,7 @@ async def save_config(req: ConfigRequest):
         api_key=_mask_api_key(req.api_key),
         model_name=req.model_name,
         base_url=req.base_url,
+        dimension=req.dimension,
     )
 
 
@@ -81,11 +85,13 @@ async def get_config():
             api_key="",
             model_name=DEFAULT_MODEL_NAME,
             base_url=DEFAULT_BASE_URL,
+            dimension=DEFAULT_DIMENSION,
         )
     return ConfigResponse(
         api_key=_mask_api_key(config.get("api_key", "")),
         model_name=config.get("model_name", DEFAULT_MODEL_NAME),
         base_url=config.get("base_url", DEFAULT_BASE_URL),
+        dimension=config.get("dimension", DEFAULT_DIMENSION),
     )
 
 
@@ -99,6 +105,7 @@ async def validate_config():
     api_key = config.get("api_key", "")
     model_name = config.get("model_name", DEFAULT_MODEL_NAME)
     base_url = config.get("base_url", DEFAULT_BASE_URL)
+    dimension = config.get("dimension", DEFAULT_DIMENSION)
 
     if not api_key:
         return ValidateResponse(valid=False, error="API 密钥为空，请先配置")
@@ -108,9 +115,9 @@ async def validate_config():
         response = client.embeddings.create(
             model=model_name,
             input="测试",
-            dimensions=512,
+            dimensions=dimension,
         )
-        dimension = len(response.data[0].embedding)
-        return ValidateResponse(valid=True, dimension=dimension)
+        actual_dimension = len(response.data[0].embedding)
+        return ValidateResponse(valid=True, dimension=actual_dimension)
     except Exception as e:
         return ValidateResponse(valid=False, error=str(e))

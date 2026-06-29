@@ -73,7 +73,7 @@ function ImportPage() {
       })
   }, [importResult]) // 导入完成后刷新状态
 
-  /** 上传文件到后端 */
+  /** 上传文件到后端（Base64 JSON 方式，兼容沙箱代理环境） */
   const uploadFile = async (file: File) => {
     if (!file.name.endsWith('.xlsx') && !file.name.endsWith('.xls')) {
       setUploadError('仅支持 .xlsx 和 .xls 格式的文件')
@@ -87,12 +87,22 @@ function ImportPage() {
     setImportResult(null)
     setImportError(null)
 
-    const formData = new FormData()
-    formData.append('file', file)
-
     try {
-      const response = await api.post<UploadResult>('/upload', formData, {
-        headers: { 'Content-Type': 'multipart/form-data' },
+      // 读取文件为 Base64，通过 JSON 发送（避免 multipart 在代理环境被截断）
+      const reader = new FileReader()
+      const base64Data = await new Promise<string>((resolve, reject) => {
+        reader.onload = () => {
+          const result = reader.result as string
+          // 去掉 data:...;base64, 前缀
+          resolve(result.split(',')[1])
+        }
+        reader.onerror = reject
+        reader.readAsDataURL(file)
+      })
+
+      const response = await api.post<UploadResult>('/upload/base64', {
+        filename: file.name,
+        data: base64Data,
       })
       setUploadResult(response.data)
       setMapping(response.data.mapping)
