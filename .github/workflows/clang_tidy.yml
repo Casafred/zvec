@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Shallow checkout (no submodules)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           submodules: false
           fetch-depth: 0
@@ -47,7 +47,7 @@ jobs:
         if: steps.changed_files.outputs.any_changed == 'true'
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-tidy=1:18.0-59~exp2 cmake ninja-build libomp-dev libaio-dev
+          sudo apt-get install -y clang-tidy=1:18.0-59~exp2 cmake ninja-build libomp-dev
 
       - name: Setup ccache
         if: steps.changed_files.outputs.any_changed == 'true'
@@ -129,7 +129,7 @@ jobs:
       - name: Restore generated headers cache
         id: cache_headers
         if: steps.changed_files.outputs.any_changed == 'true'
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@v6
         with:
           path: |
             build/external
@@ -144,7 +144,7 @@ jobs:
 
       - name: Save generated headers cache
         if: steps.tidy_files.outputs.any_tidy_files == 'true' && steps.cache_headers.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@v6
         with:
           path: |
             build/external

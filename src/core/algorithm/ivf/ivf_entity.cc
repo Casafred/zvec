@@ -71,6 +71,16 @@ int IVFEntity::IVFReformerWrapper::init(const IndexMeta &imeta) {
   return 0;
 }
 
+//! Load reformer state (e.g. rotation matrix) from storage
+int IVFEntity::IVFReformerWrapper::load(const IndexStorage::Pointer &storage) {
+  if (!reformer_) {
+    return 0;
+  }
+  int ret = reformer_->load(storage);
+  ivf_check_with_msg(ret, "Failed to load reformer state");
+  return 0;
+}
+
 //! Update the params, Called by gpu searcher only
 int IVFEntity::IVFReformerWrapper::update(const IndexMeta &meta) {
   auto &name = meta.reformer_name();
@@ -503,6 +513,12 @@ int IVFEntity::load(const IndexStorage::Pointer &container) {
 
   //! Load the remaining segments
   container_ = container;
+
+  //! Load reformer state (e.g. rotation matrix) from the main container,
+  //! which holds the rotator segment dumped at build time.
+  ret = reformer_.load(container);
+  ivf_check_error_code(ret);
+
   size_t expect_size = header_.inverted_body_size;
   inverted_ = load_segment(IVF_INVERTED_BODY_SEG_ID, expect_size);
   if (!inverted_) {
@@ -628,7 +644,7 @@ int IVFEntity::search(size_t inverted_list_id, const void *query,
       ailego_assert_with(block_vecs < sizeof(keeps) * 8, "bits overflow");
       for (size_t k = 0; k < vecs_count; ++k) {
         if (!filter(block_keys[k])) {
-          keeps |= (1 << k);
+          keeps |= (1ULL << k);
         } else {
           ++(*context_stats->mutable_filtered_count());
         }
@@ -645,7 +661,7 @@ int IVFEntity::search(size_t inverted_list_id, const void *query,
 
       uint32_t id_off = list_meta->id_offset + (i + b) * block_vecs;
       for (size_t k = 0; k < vecs_count; ++k) {
-        if (keeps & (1 << k)) {
+        if (keeps & (1ULL << k)) {
           if (block_keys[k] != kInvalidKey) {
             heap->emplace(block_keys[k], distances[k] * norm_val, id_off + k);
           }

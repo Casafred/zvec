@@ -22,7 +22,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: main # Always use main for nightly
           submodules: recursive
@@ -48,7 +48,8 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y lcov
+          sudo apt-get install -y --no-install-recommends lcov
+          sudo apt-get install -y libaio1t64 || sudo apt-get install -y libaio1
         shell: bash
 
       - name: Install dependencies

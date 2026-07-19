@@ -233,7 +233,7 @@ class IVFEntity {
       return this->convert_to_normalize_value(scale);
     }
 
-    return norm_value_;
+    return 1.0f;
   }
 
   //! Check whether the feature segment exist
@@ -266,6 +266,9 @@ class IVFEntity {
 
     //! Initialize
     int init(const IndexMeta &imeta);
+
+    //! Load reformer state (e.g. rotation matrix) from storage
+    int load(const IndexStorage::Pointer &storage);
 
     //! Update
     int update(const IndexMeta &meta);

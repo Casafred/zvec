@@ -160,6 +160,11 @@ class CollectionImpl : public Collection {
   Status switch_to_new_segment_for_writing(
       const CollectionSchema::Ptr &schema = nullptr);
 
+  Status commit_schema_change_with_new_writing_segment(
+      const CollectionSchema::Ptr &new_schema,
+      const Segment::Ptr &old_writing_segment, const Version &old_version,
+      Version *new_version, uint64_t writing_min_doc_id);
+
   Result<WriteResults> write_impl(std::vector<Doc> &docs, WriteMode mode);
 
   std::vector<Segment::Ptr> get_all_segments() const;
@@ -493,54 +498,18 @@ Status CollectionImpl::CreateIndex(const std::string &column_name,
   // forbidden writing until index is ready
   std::lock_guard write_lock(write_mtx_);
 
-  Version new_version = version_manager_->get_current_version();
-
   if (writing_segment_->doc_count() > 0) {
-    s = writing_segment_->dump();
+    s = switch_to_new_segment_for_writing();
     CHECK_RETURN_STATUS(s);
-
-    s = segment_manager_->add_segment(writing_segment_);
-    CHECK_RETURN_STATUS(s);
-
-    auto seg_options =
-        SegmentOptions{false, options_.enable_mmap_, options_.max_buffer_size_};
-    auto new_segment = Segment::CreateAndOpen(
-        path_, *new_schema, allocate_segment_id(),
-        writing_segment_->meta()->max_doc_id() + 1, id_map_, delete_store_,
-        version_manager_, seg_options);
-    if (!new_segment) {
-      return new_segment.error();
-    }
-
-    s = new_version.add_persisted_segment_meta(writing_segment_->meta());
-    CHECK_RETURN_STATUS(s);
-
-    writing_segment_ = new_segment.value();
-    new_version.set_next_segment_id(segment_id_allocator_.load());
-
-  } else {
-    // TODO: allocate new segment id and clear current writing segment at last
-    // recreate writing segment
-    s = writing_segment_->destroy();
-    CHECK_RETURN_STATUS(s);
-    auto id = writing_segment_->id();
-    auto min_doc_id = writing_segment_->meta()->min_doc_id();
-    writing_segment_.reset();
-    SegmentOptions seg_options;
-    seg_options.enable_mmap_ = options_.enable_mmap_;
-    seg_options.max_buffer_size_ = options_.max_buffer_size_;
-    seg_options.read_only_ = options_.read_only_;
-    auto writing_segment =
-        Segment::CreateAndOpen(path_, *new_schema, id, min_doc_id, id_map_,
-                               delete_store_, version_manager_, seg_options);
-    if (!writing_segment) {
-      return writing_segment.error();
-    }
-    writing_segment_ = writing_segment.value();
   }
-  new_version.reset_writing_segment_meta(writing_segment_->meta());
 
-  // get_all_segment will return writing segment if it has docs
+  auto old_writing_segment = writing_segment_;
+  Version old_version = version_manager_->get_current_version();
+  Version new_version = old_version;
+  auto writing_min_doc_id = old_writing_segment->meta()->min_doc_id();
+
+  // DDL tasks only run on persisted segments. Non-empty writing segment has
+  // already been switched to a persisted segment above.
   auto persist_segments = get_all_persist_segments();
 
   bool is_vector_field = field->is_vector_field();
@@ -562,22 +531,10 @@ Status CollectionImpl::CreateIndex(const std::string &column_name,
         "] is not supported");
   }
 
-  if (tasks.empty()) {
-    new_version.set_schema(*new_schema);
-
-    s = version_manager_->apply(new_version);
+  if (!tasks.empty()) {
+    s = execute_tasks(tasks);
     CHECK_RETURN_STATUS(s);
-
-    // persist manifest
-    s = version_manager_->flush();
-    CHECK_RETURN_STATUS(s);
-
-    schema_ = new_schema;
-    return Status::OK();
   }
-
-  s = execute_tasks(tasks);
-  CHECK_RETURN_STATUS(s);
 
   new_version.set_schema(*new_schema);
 
@@ -600,12 +557,9 @@ Status CollectionImpl::CreateIndex(const std::string &column_name,
     CHECK_RETURN_STATUS(s);
   }
 
-  // 2. update version
-  s = version_manager_->apply(new_version);
-  CHECK_RETURN_STATUS(s);
-
-  // 3. persist version
-  s = version_manager_->flush();
+  s = commit_schema_change_with_new_writing_segment(
+      new_schema, old_writing_segment, old_version, &new_version,
+      writing_min_doc_id);
   CHECK_RETURN_STATUS(s);
 
   // 4. remove old segments or block
@@ -631,8 +585,6 @@ Status CollectionImpl::CreateIndex(const std::string &column_name,
     }
     CHECK_RETURN_STATUS(s);
   }
-
-  schema_ = new_schema;
 
   return Status::OK();
 }
@@ -719,52 +671,15 @@ Status CollectionImpl::DropIndex(const std::string &column_name) {
   // forbidden writing until index is ready
   std::lock_guard write_lock(write_mtx_);
 
-  Version new_version = version_manager_->get_current_version();
-
   if (writing_segment_->doc_count() > 0) {
-    s = writing_segment_->dump();
+    s = switch_to_new_segment_for_writing();
     CHECK_RETURN_STATUS(s);
-
-    s = segment_manager_->add_segment(writing_segment_);
-    CHECK_RETURN_STATUS(s);
-
-    auto new_segment =
-        Segment::CreateAndOpen(path_, *new_schema, allocate_segment_id(),
-                               writing_segment_->meta()->max_doc_id() + 1,
-                               id_map_, delete_store_, version_manager_,
-                               SegmentOptions{false, options_.enable_mmap_,
-                                              options_.max_buffer_size_});
-    if (!new_segment) {
-      return new_segment.error();
-    }
-
-    s = new_version.add_persisted_segment_meta(writing_segment_->meta());
-    CHECK_RETURN_STATUS(s);
-
-    writing_segment_ = new_segment.value();
-    new_version.set_next_segment_id(segment_id_allocator_.load());
-
-  } else {
-    // recreate writing segment
-    s = writing_segment_->destroy();
-    CHECK_RETURN_STATUS(s);
-    auto id = writing_segment_->id();
-    auto min_doc_id = writing_segment_->meta()->min_doc_id();
-    writing_segment_.reset();
-    SegmentOptions seg_options;
-    seg_options.enable_mmap_ = options_.enable_mmap_;
-    seg_options.max_buffer_size_ = options_.max_buffer_size_;
-    seg_options.read_only_ = options_.read_only_;
-    auto writing_segment =
-        Segment::CreateAndOpen(path_, *new_schema, id, min_doc_id, id_map_,
-                               delete_store_, version_manager_, seg_options);
-    if (!writing_segment) {
-      return writing_segment.error();
-    }
-
-    writing_segment_ = writing_segment.value();
   }
-  new_version.reset_writing_segment_meta(writing_segment_->meta());
+
+  auto old_writing_segment = writing_segment_;
+  Version old_version = version_manager_->get_current_version();
+  Version new_version = old_version;
+  auto writing_min_doc_id = old_writing_segment->meta()->min_doc_id();
 
   auto persist_segments = get_all_persist_segments();
 
@@ -784,22 +699,10 @@ Status CollectionImpl::DropIndex(const std::string &column_name) {
         "] on column[", column_name, "] is not supported");
   }
 
-  if (tasks.empty()) {
-    new_version.set_schema(*new_schema);
-
-    s = version_manager_->apply(new_version);
+  if (!tasks.empty()) {
+    s = execute_tasks(tasks);
     CHECK_RETURN_STATUS(s);
-
-    // persist manifest
-    s = version_manager_->flush();
-    CHECK_RETURN_STATUS(s);
-
-    schema_ = new_schema;
-    return Status::OK();
   }
-
-  s = execute_tasks(tasks);
-  CHECK_RETURN_STATUS(s);
 
   new_version.set_schema(*new_schema);
 
@@ -822,11 +725,9 @@ Status CollectionImpl::DropIndex(const std::string &column_name) {
     CHECK_RETURN_STATUS(s);
   }
 
-  s = version_manager_->apply(new_version);
-  CHECK_RETURN_STATUS(s);
-
-  // persist manifest
-  s = version_manager_->flush();
+  s = commit_schema_change_with_new_writing_segment(
+      new_schema, old_writing_segment, old_version, &new_version,
+      writing_min_doc_id);
   CHECK_RETURN_STATUS(s);
 
   // 4. remove old segments or block
@@ -851,8 +752,6 @@ Status CollectionImpl::DropIndex(const std::string &column_name) {
     }
     CHECK_RETURN_STATUS(s);
   }
-
-  schema_ = new_schema;
 
   return Status::OK();
 }
@@ -1574,6 +1473,47 @@ bool CollectionImpl::need_switch_to_new_segment() const {
   return writing_segment_->doc_count() >= schema_->max_doc_count_per_segment();
 }
 
+Status CollectionImpl::commit_schema_change_with_new_writing_segment(
+    const CollectionSchema::Ptr &new_schema,
+    const Segment::Ptr &old_writing_segment, const Version &old_version,
+    Version *new_version, uint64_t writing_min_doc_id) {
+  if (new_version == nullptr) {
+    return Status::InvalidArgument("new_version is null");
+  }
+
+  auto seg_options =
+      SegmentOptions{false, options_.enable_mmap_, options_.max_buffer_size_};
+  auto new_writing_segment = Segment::CreateAndOpen(
+      path_, *new_schema, allocate_segment_id(), writing_min_doc_id, id_map_,
+      delete_store_, version_manager_, seg_options);
+  if (!new_writing_segment) {
+    return new_writing_segment.error();
+  }
+  new_version->reset_writing_segment_meta(new_writing_segment.value()->meta());
+  new_version->set_next_segment_id(segment_id_allocator_.load());
+
+  auto s = version_manager_->apply(*new_version);
+  if (!s.ok()) {
+    new_writing_segment.value()->destroy();
+    return s;
+  }
+
+  s = version_manager_->flush();
+  if (!s.ok()) {
+    new_writing_segment.value()->destroy();
+    auto rollback_status = version_manager_->apply(old_version);
+    CHECK_RETURN_STATUS(rollback_status);
+    return s;
+  }
+
+  schema_ = new_schema;
+  writing_segment_ = new_writing_segment.value();
+  s = old_writing_segment->destroy();
+  CHECK_RETURN_STATUS(s);
+
+  return Status::OK();
+}
+
 Status CollectionImpl::switch_to_new_segment_for_writing(
     const CollectionSchema::Ptr &schema) {
   auto s = writing_segment_->dump();
@@ -1667,14 +1607,14 @@ Result<DocPtrList> CollectionImpl::Query(const SearchQuery &query) const {
 
   CHECK_DESTROY_RETURN_STATUS_EXPECTED(destroyed_, false);
 
-  SearchQuery sanitized = query;
   // When field_name_ is set, use get_field to retrieve the schema uniformly.
-  // validate_and_sanitize checks that the field type matches the query type
+  // validate checks that the field type matches the query type
   // (FTS query requires an FTS field, vector query requires a vector field).
-  const auto &field_name = sanitized.target_.field_name_;
+  const auto &field_name = query.target_.field_name_;
   const FieldSchema *field_schema =
       field_name.empty() ? nullptr : schema_->get_field(field_name);
-  auto s = sanitized.validate_and_sanitize(field_schema);
+  bool need_sanitize = false;
+  auto s = query.validate(field_schema, &need_sanitize);
   CHECK_RETURN_STATUS_EXPECTED(s);
 
   auto segments = get_all_segments();
@@ -1682,7 +1622,15 @@ Result<DocPtrList> CollectionImpl::Query(const SearchQuery &query) const {
     return DocPtrList();
   }
 
-  return sql_engine_->execute(schema_, std::move(sanitized), segments);
+  if (!need_sanitize) {
+    return sql_engine_->execute(schema_, query, segments);
+  }
+
+  // Sparse needs sanitization: make a mutable copy and sort indices in place.
+  SearchQuery sanitized_query = query;
+  auto ss = sanitize_sparse_vector(sanitized_query.target_, field_schema);
+  CHECK_RETURN_STATUS_EXPECTED(ss);
+  return sql_engine_->execute(schema_, std::move(sanitized_query), segments);
 }
 
 Result<DocPtrList> CollectionImpl::Query(const MultiQuery &query) const {
@@ -1694,6 +1642,11 @@ Result<DocPtrList> CollectionImpl::Query(const MultiQuery &query) const {
     return tl::make_unexpected(Status::InvalidArgument(
         "Invalid query: MultiQuery requires at least 2 sub-queries, got ",
         query.queries.size()));
+  }
+
+  if (auto s = validate_topk_and_output_fields(query.topk, query.output_fields);
+      !s.ok()) {
+    return tl::make_unexpected(s);
   }
 
   auto segments = get_all_segments();
@@ -1716,6 +1669,10 @@ Result<DocPtrList> CollectionImpl::Query(const MultiQuery &query) const {
     }
     auto *field_schema = field_ptr.get();
 
+    bool need_sanitize = false;
+    auto s = target.validate(field_schema, &need_sanitize);
+    CHECK_RETURN_STATUS_EXPECTED(s);
+
     SearchQuery sq;
     sq.target_ = target;
     sq.topk_ = sub.num_candidates_;
@@ -1724,8 +1681,10 @@ Result<DocPtrList> CollectionImpl::Query(const MultiQuery &query) const {
     sq.include_doc_id_ = query.include_doc_id_;
     sq.output_fields_ = query.output_fields;
 
-    auto s = sq.validate_and_sanitize(field_schema);
-    CHECK_RETURN_STATUS_EXPECTED(s);
+    if (need_sanitize) {
+      auto ss = sanitize_sparse_vector(sq.target_, field_schema);
+      CHECK_RETURN_STATUS_EXPECTED(ss);
+    }
     pending_queries.push_back(std::move(sq));
     field_schemas.push_back(std::move(field_ptr));
   }
@@ -1777,7 +1736,22 @@ Result<GroupResults> CollectionImpl::GroupByQuery(
     return GroupResults();
   }
 
-  return sql_engine_->execute_group_by(schema_, query, segments);
+  // Determine vector data source (zero-copy for dense, copy+sort for sparse)
+  const FieldSchema *field_schema =
+      schema_->get_field(query.target_.field_name_);
+  bool need_sanitize = false;
+  auto s = query.target_.validate(field_schema, &need_sanitize);
+  CHECK_RETURN_STATUS_EXPECTED(s);
+
+  if (!need_sanitize) {
+    return sql_engine_->execute_group_by(schema_, query, segments);
+  }
+
+  // Sparse needs sanitization: make a mutable copy and sort indices in place.
+  GroupByVectorQuery sanitized_query = query;
+  auto ss = sanitize_sparse_vector(sanitized_query.target_, field_schema);
+  CHECK_RETURN_STATUS_EXPECTED(ss);
+  return sql_engine_->execute_group_by(schema_, sanitized_query, segments);
 }
 
 Result<DocPtrMap> CollectionImpl::Fetch(
@@ -1953,7 +1927,8 @@ Status CollectionImpl::create() {
   }
   if (ailego::FileHelper::IsExist(path_.c_str())) {
     return Status::InvalidArgument("path validate failed: path[", path_,
-                                   "] exists");
+                                   "] exists, create expects a path that does "
+                                   "not exist");
   }
 
   // check schema
@@ -2056,7 +2031,7 @@ Status CollectionImpl::acquire_file_lock(bool create) {
       return Status::InternalError("Can't create lock file: ", lock_file_path);
     }
   } else {
-    if (!lock_file_.open(lock_file_path.c_str(), false)) {
+    if (!lock_file_.open(lock_file_path.c_str(), options_.read_only_)) {
       return Status::InternalError("Can't open lock file: ", lock_file_path);
     }
   }

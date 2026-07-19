@@ -11,7 +11,7 @@ from .extension import ReRanker, RrfReRanker, WeightedReRanker
 from .extension.embedding import DenseEmbeddingFunction
 from .model import param, schema
 from .model.collection import Collection
-from .model.doc import Doc, DocList
+from .model.doc import Doc, DocList, GroupResult
 from .model.param import (
     AddColumnOption,
     AlterColumnOption,
@@ -19,6 +19,8 @@ from .model.param import (
     DiskAnnIndexParam,
     DiskAnnQueryParam,
     FlatIndexParam,
+    FtsIndexParam,
+    FtsQueryParam,
     HnswIndexParam,
     HnswQueryParam,
     HnswRabitqIndexParam,
@@ -28,15 +30,17 @@ from .model.param import (
     IVFIndexParam,
     IVFQueryParam,
     OptimizeOption,
+    QuantizerParam,
     VamanaIndexParam,
     VamanaQueryParam,
 )
-from .model.param.query import Query, VectorQuery
+from .model.param.query import Fts, Query, VectorQuery
 from .model.schema import CollectionSchema, CollectionStats, FieldSchema, VectorSchema
 from .tool import require_module
 from .typing import (
     DataType,
     IndexType,
+    IOBackendType,
     MetricType,
     QuantizeType,
     Status,
@@ -44,6 +48,22 @@ from .typing import (
 )
 from .typing.enum import LogLevel, LogType
 from .zvec import create_and_open, init, open
+
+def io_backend_type() -> IOBackendType:
+    """Returns the current I/O backend type for DiskAnn async disk reads
+    as an IOBackendType enum (zvec.typing.IOBackendType).
+    IOBackendType.LIBAIO if libaio is available, IOBackendType.PREAD otherwise."""
+
+def io_backend_description() -> str:
+    """Returns a human-readable description of the current I/O backend.
+    When only pread is available, includes instructions for installing
+    libaio to enable async I/O."""
+
+def set_default_jieba_dict_dir(dir: str) -> None:
+    """Register the process-wide default jieba dict directory."""
+
+def get_default_jieba_dict_dir() -> str:
+    """Read the currently registered default jieba dict directory."""
 
 __all__: list = [
     "AddColumnOption",
@@ -60,10 +80,15 @@ __all__: list = [
     "DocList",
     "FieldSchema",
     "FlatIndexParam",
+    "Fts",
+    "FtsIndexParam",
+    "FtsQueryParam",
+    "GroupResult",
     "HnswIndexParam",
     "HnswQueryParam",
     "HnswRabitqIndexParam",
     "HnswRabitqQueryParam",
+    "IOBackendType",
     "IVFIndexParam",
     "IVFQueryParam",
     "IndexOption",
@@ -74,6 +99,7 @@ __all__: list = [
     "MetricType",
     "OptimizeOption",
     "QuantizeType",
+    "QuantizerParam",
     "Query",
     "ReRanker",
     "RrfReRanker",
@@ -85,9 +111,13 @@ __all__: list = [
     "VectorSchema",
     "WeightedReRanker",
     "create_and_open",
+    "get_default_jieba_dict_dir",
     "init",
+    "io_backend_description",
+    "io_backend_type",
     "open",
     "require_module",
+    "set_default_jieba_dict_dir",
 ]
 
 class _Collection:
@@ -125,7 +155,7 @@ class _Collection:
         include_vector: bool = True,
     ) -> dict[str, _Doc]: ...
     def Flush(self) -> None: ...
-    def GroupByQuery(self, arg0: ...) -> list[...]: ...
+    def GroupByQuery(self, arg0: param._GroupByVectorQuery) -> list[_GroupResult]: ...
     def Insert(self, arg0: collections.abc.Sequence[_Doc]) -> list[typing.Status]: ...
     def Optimize(self, arg0: param.OptimizeOption) -> None: ...
     def Options(self) -> param.CollectionOption: ...
@@ -157,6 +187,12 @@ class _Doc:
     def set_any(self, arg0: str, arg1: typing.DataType, arg2: typing.Any) -> bool: ...
     def set_pk(self, arg0: str) -> None: ...
     def set_score(self, arg0: typing.SupportsFloat) -> None: ...
+
+class _GroupResult:
+    @property
+    def docs(self) -> list[_Doc]: ...
+    @property
+    def group_by_value(self) -> str: ...
 
 class _DocOp:
     """

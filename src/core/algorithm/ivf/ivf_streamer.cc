@@ -86,6 +86,13 @@ int IVFStreamer::open(IndexStorage::Pointer storage) {
   }
 
   auto reformer = centroid_index_->reformer();
+  if (reformer) {
+    //! The centroid index is loaded from the centroid sub-segment which does
+    //! not contain the rotator segment. Load the reformer state (e.g. rotation
+    //! matrix) from the main storage instead.
+    ret = reformer->load(storage);
+    ivf_check_error_code(ret);
+  }
   params_.set(PARAM_IVF_SEARCHER_CONVERTER_REFORMER, reformer);
 
   //! load iverted index
@@ -100,6 +107,9 @@ int IVFStreamer::open(IndexStorage::Pointer storage) {
 
   stats_.set_loaded_count(entity_->vector_count());
   stats_.set_loaded_costtime(timer.milli_seconds());
+
+  LOG_INFO("IVFStreamer open done, vector_count=%zu, inverted_list_count=%zu",
+           entity_->vector_count(), entity_->inverted_list_count());
 
   searcher_state_ = STATE_LOADED;
   return 0;
@@ -219,7 +229,7 @@ int IVFStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
     auto &context_stats = ctx->mutable_stats(q);
     auto &heap = ctx->mutable_result_heap();
     heap.clear();
-    uint32_t total_scan_count = 0;
+    size_t total_scan_count = 0;
     for (size_t i = 0;
          i < centroids.size() && total_scan_count < ctx->max_scan_count();
          ++i) {

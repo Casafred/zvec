@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <fcntl.h>
+#include <chrono>
 #include <future>
 #include <gtest/gtest.h>
 #include <zvec/ailego/container/vector.h>
@@ -99,18 +100,49 @@ TEST_F(DiskAnnBuilderTest, TestGeneral) {
   ASSERT_GT(stats.built_costtime(), 0UL);
 }
 
-// DiskAnn is now exposed implicitly: no caller ever invokes a
-// ``LoadDiskAnnPlugin`` / ``IsLibAioAvailable`` API (those were removed from
-// the public surface together with ``zvec.load_diskann_plugin()`` in Python).
-// The only contract this test validates is the UX guarantee: once the DiskAnn
-// module has been linked into the hosting binary (here, directly into the
-// test via the ``core_knn_diskann`` target), its factory entries are
-// registered automatically and the global ``IndexFactory`` can hand out a
-// ``DiskAnnBuilder`` without any explicit setup step. On hosts missing
-// libaio, DiskAnn would fail at the index-creation layer with a clear error
-// while other index types (HNSW/IVF/Flat/Vamana) remain unaffected; that
-// runtime branch lives in ``DiskAnnIndex::CreateAndInitStreamer`` and is
-// covered by the higher-level interface tests.
+// Regression test: building a small DiskAnn index must complete quickly.
+// A lost-wakeup bug in the condition-variable progress loops previously caused
+// 15–30 second stalls during train/build on small datasets because
+// notify_one() was either missing or racing against a wrong predicate.
+TEST_F(DiskAnnBuilderTest, SmallDatasetBuildTime) {
+  constexpr size_t kSmallDim = 4;
+  constexpr size_t kSmallDocCnt = 12;
+
+  auto meta = make_shared<IndexMeta>(IndexMeta::DataType::DT_FP32, kSmallDim);
+  meta->set_metric("SquaredEuclidean", 0, Params());
+
+  IndexBuilder::Pointer builder = IndexFactory::CreateBuilder("DiskAnnBuilder");
+  ASSERT_NE(builder, nullptr);
+
+  auto holder = make_shared<MultiPassIndexHolder<IndexMeta::DataType::DT_FP32>>(
+      kSmallDim);
+  for (size_t i = 0; i < kSmallDocCnt; ++i) {
+    NumericalVector<float> vec(kSmallDim, static_cast<float>(i));
+    ASSERT_TRUE(holder->emplace(i, vec));
+  }
+
+  Params params;
+  params.set("zvec.diskann.builder.max_degree", 32);
+  params.set("zvec.diskann.builder.list_size", 50);
+  params.set("zvec.diskann.builder.max_pq_chunk_num", 2);
+  params.set("zvec.diskann.builder.threads", 4);
+
+  ASSERT_EQ(0, builder->init(*meta, params));
+
+  auto t0 = std::chrono::steady_clock::now();
+  ASSERT_EQ(0, builder->train(holder));
+  ASSERT_EQ(0, builder->build(holder));
+  auto t1 = std::chrono::steady_clock::now();
+
+  auto elapsed_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+  // Before the fix, this took 15–30 seconds. After the fix, it should
+  // complete in well under 5 seconds even on slow CI machines.
+  EXPECT_LT(elapsed_ms, 5000)
+      << "DiskAnn build with " << kSmallDocCnt << " vectors took " << elapsed_ms
+      << " ms — likely a lost-wakeup regression in progress loops.";
+}
+
 TEST_F(DiskAnnBuilderTest, TestImplicitFactoryRegistration) {
   IndexBuilder::Pointer builder = IndexFactory::CreateBuilder("DiskAnnBuilder");
   ASSERT_NE(builder, nullptr)
